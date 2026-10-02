@@ -1,27 +1,36 @@
 import gc
 import os
 import sys
+import uuid
 import hashlib
 import atexit
 from typing import Dict, List, Any
 import subprocess
 
-import psutil
 import win32con
 import win32gui
-import win32process
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QSize, QTimer, QRect, QEvent, QPoint
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QSize, QTimer, QRect, QEvent
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QPen
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QPushButton, QFileDialog, QVBoxLayout, QHBoxLayout,
-                               QDialog, QLabel, QInputDialog)
-# 添加获取任务栏固定程序所需的库
-from win32com.shell import shell  # type: ignore
+                               QDialog, QInputDialog)
 from core.custom_ui import IconHoverFilter, ContextPopup, ShutdownDialog
+from core.dock_constants import DockConstants
+from core.dock_tooltip import DockTooltip
+from core.fullscreen_watch import (
+    DEFAULT_ENTER_CONFIRM,
+    DEFAULT_EXIT_CONFIRM,
+    DEFAULT_POLL_INTERVAL_MS,
+    DEFAULT_TOLERANCE,
+    FullscreenWatcherWorker,
+)
 from core.process_manager import ProcessManager
+from core.process_scan import ProcessScanWorker
+from core import pinned_apps
 import core.sys32 as sys32
 import core.log_maker as log_maker
 import core.config_manager as Config
 import core.settings as settings
+from features.XHT.Lib import XHTWindow
 
 from core.thread_mgr import manager
 
@@ -32,85 +41,17 @@ log = log_maker.logger()
 log.disable_debug()
 
 
-# 常量定义
-class DockConstants:
-    """Dock应用常量定义"""
-    BUTTON_SIZE = 60
-    ICON_SIZE = 48
-    BORDER_RADIUS = 16
-    WINDOW_BORDER_RADIUS = 18
-    BUTTON_SPACING = 10
-    WINDOW_MARGIN = 0
-    SEPARATOR_WIDTH = 2
-    PROCESS_CHECK_INTERVAL = 500   # 进程检查间隔（毫秒）
-    
-    # 颜色常量（基于UI配色方案）
-    COLOR_BACKGROUND = "#F8F9FA"      # Surface - 卡片、输入框背景
-    COLOR_HOVER = "#80E0D7"           # Primary Light - 悬停状态
-    COLOR_BORDER_ACTIVE = "#39C5BB"   # Primary - 主色
-    COLOR_BORDER_INACTIVE = "#ADB5BD" # Text Disabled - 禁用/非活跃边框
-    COLOR_BG_ACTIVE = "#39C5BB"       # Primary - 运行中背景
-    COLOR_BG_HOVER_ACTIVE = "#80E0D7" # Primary Light - 运行中悬停
-    COLOR_BG_HOVER_INACTIVE = "#80E0D7" # Primary Light - 非活跃悬停
-    COLOR_SEPARATOR = "#ADB5BD"       # Text Disabled - 分隔符
-    COLOR_WINDOW_BORDER = "#212529"   # Text Primary - 窗口边框
-    COLOR_TOOLTIP = "#39C5BB"         # Primary - 工具提示
-    
-    # 样式表模板
-    BUTTON_STYLE_RUNNING = f"""
-        QPushButton {{
-            border: 2px solid {COLOR_BORDER_ACTIVE};
-            border-radius: {BORDER_RADIUS}px;
-            background-color: {COLOR_BG_ACTIVE};
-        }}
-        QPushButton:hover {{
-            border: 2px solid {COLOR_BORDER_ACTIVE};
-            background-color: {COLOR_BG_HOVER_ACTIVE};
-        }}
-    """
-    
-    BUTTON_STYLE_INACTIVE = f"""
-        QPushButton {{
-            border: 2px solid {COLOR_BORDER_INACTIVE};
-            border-radius: {BORDER_RADIUS}px;
-            background-color: {COLOR_BACKGROUND};
-        }}
-        QPushButton:hover {{
-            border: 2px solid {COLOR_BORDER_ACTIVE};
-            background-color: {COLOR_BG_HOVER_INACTIVE};
-        }}
-    """
-    
-    CONTAINER_STYLE = f"""
-        QWidget {{
-            background-color: {COLOR_BACKGROUND};
-            border-radius: {BORDER_RADIUS}px;
-        }}
-    """
-    
-    SEPARATOR_STYLE = f"""
-        QWidget {{
-            background-color: {COLOR_SEPARATOR};
-            border-radius: 1px;
-        }}
-    """
-    
-    MAIN_WINDOW_STYLE = f"""
-        QMainWindow {{
-            background: {COLOR_BACKGROUND};
-            border: 1px solid {COLOR_WINDOW_BORDER};
-            border-radius: {WINDOW_BORDER_RADIUS}px;
-        }}
-        QPushButton {{
-            border: none;
-            border-radius: {BORDER_RADIUS}px;
-            background-color: {COLOR_BACKGROUND};
-        }}
-        QPushButton:hover {{
-            background-color: {COLOR_HOVER};
-        }}
-    """
+def _config_int(value, default, minimum):
+    """配置里的整数取值：手写 JSON 里可能是字符串/空值，坏了就退回默认值。"""
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(result, minimum)
 
+
+
+# 常量与样式表统一定义在 core/dock_constants.py（纯数据，独立成模块便于复用）
 
 
 class DockApp(QMainWindow):
@@ -122,6 +63,10 @@ class DockApp(QMainWindow):
             self.script_dir = os.path.dirname(os.path.abspath(__file__))
         self.settings_file = os.path.join(self.script_dir, "settings.json")
         self.all_settings = None
+        # 命令提示符禁用模式（nocmd_mode）与内置进程管理器状态
+        self.is_cmd_disabled = False
+        self._process_mgr_worker = None
+        self._process_mgr_thread_id = None
         
         # 应用数据存储
         self.running_apps: Dict[str, str] = {}
@@ -138,12 +83,22 @@ class DockApp(QMainWindow):
         self.icon_hover_filter = IconHoverFilter(self)
         self.process_manager = ProcessManager()
         self.geometry_anim = None
-        
-        self._hidden_by_fullscreen = False
+        # 最近一次动画的目标矩形，用于避免重复重启动画（见 update_window_position）
+        self._geom_anim_target = None
+
+        self.xhtelements = []
+        self.xht_window = None  # 保存 XHT 窗口引用，防止被 GC 回收
+
         self.hwnd = None
-        
+
+        # 全屏让位状态：True = 有非系统程序正在全屏显示，AppBar 已注销、dock 已隐藏
+        # （监听逻辑见 core/fullscreen_watch.py，线程在 thread_manager 就绪后启动）
+        self._fs_suppressed = False
+        self._fs_worker = None
+        self._fs_thread_id = None
+        self._fs_last_description = ""
+
         # 图标版本管理
-        self._uid_counter = 0
         self._list_versions: Dict[str, str] = {}
         
         self.init_ui()
@@ -161,11 +116,25 @@ class DockApp(QMainWindow):
         dock_top_phys = round(self.geometry().y() * dpr)
         sys32.set_appbar_bottom(dock_top_phys)
         # 注册 atexit 兜底，确保任何退出方式都能恢复工作区
-        atexit.register(sys32.remove_appbar)
+        atexit.register(self.on_unusual_exit)
         # 使用统一的线程管理器启动所有后台服务
         self.thread_manager = manager.ThreadManager()
+        # 进程扫描线程必须等 thread_manager 就绪后再注册启动
+        self._start_process_monitoring()
+        # 全屏程序监听同样登记到 thread_manager，退出时统一收尾
+        self._start_fullscreen_watch()
+        # 分辨率/显示器变化后刷新屏幕指标缓存并重新定位
+        self._connect_screen_signals()
+
+        # 启动 XHT 浮动时间窗口
+        self.start_xht()
 
         self.destroyed.connect(self.exit_app)
+
+    def on_unusual_exit(self):
+        """处理非正常退出"""
+        sys32.remove_appbar()
+        sys32.show_window(sys32.HWND_TRAY)
 
 
 
@@ -251,10 +220,10 @@ class DockApp(QMainWindow):
         return button
 
     def load_pinned_apps(self):
-        """获取Windows任务栏上固定的应用程序"""
+        """获取 Windows 任务栏上固定的应用程序（实现见 core/pinned_apps.py）。"""
         try:
-            pinned_apps = self.get_pinned_apps_from_taskbar()
-            self.pinned_apps = pinned_apps
+            # 注意局部名不要叫 pinned_apps，否则会遮蔽上面 import 的模块
+            self.pinned_apps = pinned_apps.discover_pinned_apps(self.process_manager, log)
         except Exception as e:
             self.handle_error(f"获取固定应用时出错: {e}")
             self.pinned_apps = []
@@ -265,136 +234,106 @@ class DockApp(QMainWindow):
         if show_dialog:
             sys32.messagebox("错误", message, sys32.MB_ICONSTOP | sys32.MB_OKCANCEL)
 
-    def get_pinned_apps_from_taskbar(self):
-        """从任务栏固定的应用程序路径获取应用"""
-        pinned_apps = []
-        try:
-            # Windows 10/11 任务栏固定应用的位置
-            appdata = os.getenv('APPDATA')
-            pinned_dir = os.path.join(appdata, 'Microsoft', 'Internet Explorer', 'Quick Launch', 'User Pinned', 'TaskBar')
-            
-            if os.path.exists(pinned_dir):
-                for item in os.listdir(pinned_dir):
-                    if item.endswith('.lnk'):
-                        shortcut_path = os.path.join(pinned_dir, item)
-                        app_info = self.get_app_info_from_shortcut(shortcut_path)
-                        if app_info:
-                            # 检查是否已存在，避免重复
-                            if not any(app['name'] == app_info['name'] for app in pinned_apps):
-                                pinned_apps.append(app_info)
-        
-        except Exception as e:
-            self.handle_error(f"获取任务栏固定应用失败: {e}")
-            return []
-            
-        return pinned_apps
-
-    def get_app_info_from_shortcut(self, shortcut_path):
-        """从快捷方式获取应用信息"""
-        try:
-            import pythoncom
-            
-            # 使用shell接口获取快捷方式信息
-            shortcut = pythoncom.CoCreateInstance(
-                shell.CLSID_ShellLink, None, pythoncom.CLSCTX_INPROC_SERVER, shell.IID_IShellLink
-            )
-            persist_file = shortcut.QueryInterface(pythoncom.IID_IPersistFile)
-            persist_file.Load(shortcut_path)
-            
-            # 获取目标路径
-            target_path = shortcut.GetPath(shell.SLGP_RAWPATH)[0]
-            if not target_path or not os.path.exists(target_path):
-                return None
-                
-            # 获取应用名称（从快捷方式名称或可执行文件名）
-            app_name = os.path.splitext(os.path.basename(shortcut_path))[0]
-            if not app_name:
-                app_name = os.path.splitext(os.path.basename(target_path))[0]
-                
-            # 获取图标路径（如果存在）
-            icon_path, icon_index = shortcut.GetIconLocation()
-            if not icon_path or not os.path.exists(icon_path):
-                icon_path = None
-                
-            # 提取图标（使用 ProcessManager 提供的统一接口）
-            if not icon_path:
-                icon_path = self.process_manager.extract_icon(target_path)
-            else:
-                # 如果快捷方式指定了图标，但路径不存在，尝试从目标提取
-                if not os.path.exists(icon_path):
-                    icon_path = self.process_manager.extract_icon(target_path)
-            
-            return {
-                'name': app_name,
-                'path': target_path,
-                'icon': icon_path,
-                'is_pinned': True  # 标记为固定应用
-            }
-        except Exception as e:
-            self.handle_error(f"解析快捷方式 {shortcut_path} 失败: {e}")
-            return None
-
     def setup_process_monitoring(self):
-        """设置定时器监控进程状态，并注册 WinEventHook 实现全屏变化即时响应"""
-        self.process_timer = QTimer()
-        self.process_timer.timeout.connect(self.check_running_processes)
-        self.process_timer.start(DockConstants.PROCESS_CHECK_INTERVAL)
+        """创建后台进程扫描线程。
 
-        # WinEventHook：前台窗口变化时置位标志，下次定时器触发时立即检测
-        self._fullscreen_state_changed = False
-        self._setup_fullscreen_monitor()
+        扫描本身（EnumWindows + 全量 psutil 遍历 + 图标提取）在
+        :class:`~core.process_scan.ProcessScanWorker` 里跑，这里只负责建对象和连
+        信号；线程在 thread_manager 就绪后再启动（见 ``__init__``）。
+        """
+        self._scan_worker = ProcessScanWorker(
+            self.process_manager, DockConstants.PROCESS_CHECK_INTERVAL
+        )
+        self._scan_worker.scan_finished.connect(self._on_process_scan_finished)
+        self._scan_worker.scan_failed.connect(self._on_process_scan_failed)
+        self._scan_thread_id = None
 
-    def _setup_fullscreen_monitor(self):
-        """注册 WinEventHook 监听前台窗口变化事件，即时触发全屏状态检测"""
+    def _start_process_monitoring(self):
+        """把扫描线程注册到统一线程管理器并启动（需要 thread_manager 已就绪）。"""
+        worker = getattr(self, '_scan_worker', None)
+        if worker is None:
+            return
         try:
-            import ctypes
-            from ctypes import wintypes
-
-            # EVENT_SYSTEM_FOREGROUND = 3
-            def _win_event_proc(hWinEventHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime):
-                if event == 3 and hwnd:
-                    self._fullscreen_state_changed = True
-
-            WINEVENTPROC = ctypes.WINFUNCTYPE(
-                None, wintypes.HANDLE, wintypes.DWORD, wintypes.HWND,
-                wintypes.LONG, wintypes.LONG, wintypes.DWORD, wintypes.DWORD,
+            self._scan_thread_id = self.thread_manager.create(
+                name="dock_process_scan",
+                start_when_create=True,
+                worker=worker,
             )
-            self._win_event_callback = WINEVENTPROC(_win_event_proc)
-            # SetWinEventHook(eventMin, eventMax, hmodWinEventProc, pfnWinEventProc, idProcess, idThread, dwFlags)
-            # WINEVENT_OUTOFCONTEXT = 0, WINEVENT_SKIPOWNPROCESS = 2
-            self._win_event_hook = ctypes.windll.user32.SetWinEventHook(
-                3, 3, None, self._win_event_callback, 0, 0, 0x0002,
-            )
-            if self._win_event_hook:
-                log.info("全屏监控 WinEventHook 已注册")
-            else:
-                log.warning("WinEventHook 注册失败，将完全依赖定时器轮询")
         except Exception as e:
-            log.warning(f"设置 WinEventHook 失败，将完全依赖定时器轮询: {e}")
+            # 线程管理器有数量上限（默认 16），注册失败时退化为直接启动，
+            # 至少保证「运行中应用」的显示还能工作。
+            log.warning(f"注册进程扫描线程失败，改为直接启动: {e}")
+            worker.start()
+
+    def _connect_screen_signals(self):
+        """监听显示器/分辨率变化，刷新 sys32 缓存的屏幕指标。"""
+        app = QApplication.instance()
+        if app is None:
+            return
+        for name in ("screenAdded", "screenRemoved", "primaryScreenChanged"):
+            signal = getattr(app, name, None)
+            if signal is None:
+                continue
+            try:
+                signal.connect(self._on_screen_changed)
+            except Exception as e:
+                log.debug(f"连接 {name} 信号失败: {e}")
+
+    def _on_screen_changed(self, *_args):
+        """分辨率或显示器变化：刷新指标缓存、重新注册 AppBar 并重排窗口。"""
+        try:
+            metrics = sys32.refresh_metrics()
+            log.info(f"屏幕变化，已刷新屏幕指标: {metrics}")
+            if getattr(self, '_fs_suppressed', False):
+                # 全屏让位期间 AppBar 已注销：这里再注册一次会把保留区塞回全屏
+                # 窗口，让位当场失效。改成只刷新指标，等全屏结束由
+                # exit_fullscreen_suppression() 按新分辨率重新注册。
+                log.info("当前处于全屏让位状态，跳过 AppBar 重新注册")
+                return
+            screen = QApplication.primaryScreen()
+            if screen is not None:
+                dpr = screen.devicePixelRatio()
+                sys32.set_appbar_bottom(round(self._dock_target_y() * dpr))
+            self.update_window_position()
+        except Exception as e:
+            log.error(f"处理屏幕变化时出错: {e}")
 
     def check_running_processes(self):
-        """检查所有应用的运行状态"""
+        """请求一次进程状态检查（非阻塞）。
+
+        真正的扫描在后台线程里做，结果回来后由
+        :meth:`_on_process_scan_finished` 在 GUI 线程更新界面。保留这个方法名是
+        为了兼容既有的 ``QTimer.singleShot(..., self.check_running_processes)``
+        调用点（启动/结束进程后要求尽快刷新）。
+        """
+        worker = getattr(self, '_scan_worker', None)
+        if worker is not None:
+            worker.request_scan()
+
+    def _on_process_scan_failed(self, message):
+        """后台扫描出错（只记录，不打断界面）。"""
+        log.error(f"后台进程扫描失败: {message}")
+
+    def _on_process_scan_finished(self, all_running):
+        """后台扫描完成：在 GUI 线程里比对并更新按钮状态。"""
         try:
-            current_running = {}
+            norm = self.process_manager.norm_path
             all_apps = self.pinned_apps + self.apps
-            all_apps_paths = [app['path'] for app in all_apps]
-            
-            # 一次性获取所有运行中进程（避免重复 EnumWindows）
-            # skip_known=False 确保已知应用也被检查运行状态
-            all_running = self.process_manager.get_running_processes(all_apps_paths, skip_known=False)
+
             # running_apps_list 只保留未知应用（非 pinned + 非手动添加）
-            normalized_known_paths = {self.process_manager._norm_path(app['path']) for app in all_apps}
+            normalized_known_paths = {norm(app['path']) for app in all_apps}
             self.running_apps_list = [
                 info for path, info in all_running.items()
-                if self.process_manager._norm_path(path) not in normalized_known_paths
+                if norm(path) not in normalized_known_paths
             ]
-            
+
             # 批量检查已知应用状态
-            normalized_running = {self.process_manager._norm_path(p): p for p in all_running}
+            normalized_running = {norm(p) for p in all_running}
+            current_running = {}
             for app in all_apps:
-                if self.process_manager._norm_path(app['path']) in normalized_running:
+                if norm(app['path']) in normalized_running:
                     current_running[app['name']] = app['path']
-            
+
             # 更新按钮状态
             changed_apps = set(self.running_apps.keys()) ^ set(current_running.keys())
             for app_name in changed_apps:
@@ -403,73 +342,184 @@ class DockApp(QMainWindow):
                     is_running = app_name in current_running
                     self.set_button_style(button, is_running)
                     log.info(f"应用 {app_name} 状态更新: {'运行中' if is_running else '已关闭'}")
-            
+
             self.running_apps = current_running
             self.update_app_buttons()
 
-            # 全屏状态变化时即时响应（WinEventHook 触发），否则按定时器周期检测
-            try:
-                if self._fullscreen_state_changed:
-                    self._fullscreen_state_changed = False
-                # 全屏检测已禁用，不再调整窗口层级
-                # self.adjust_window_stacking()
-            except Exception as e:
-                log.error(f"调整窗口层级时出错: {e}")
-            
         except Exception as e:
-            log.error(f"检查运行进程时出错: {e}")
-
-    def adjust_window_stacking(self):
-        """根据全屏窗口检测结果灵活调整 dock 栏的显示/隐藏"""
-        try:
-            was_hidden = self._hidden_by_fullscreen
-            fullscreen_windows = self.process_manager.get_fullscreen_windows()
-            log.debug(f"全屏窗口检测: 找到 {len(fullscreen_windows)} 个")
-            if len(fullscreen_windows) > 0:
-                if not was_hidden:
-                    log.debug("检测到全屏窗口，隐藏dock栏")
-                self.hide_dock()
-            else:
-                if was_hidden:
-                    log.debug("全屏窗口已消失，显示dock栏")
-                self.show_dock()
-        except Exception as e:
-            log.error(f"adjust_window_stacking error: {e}")
-    
-    def show_dock(self):
-        """将 dock 栏恢复为可见置顶状态。仅在被全屏隐藏时执行。"""
-        if not self._hidden_by_fullscreen or self.hwnd is None:
-            return
-        try:
-            self._hidden_by_fullscreen = False
-            sys32.show_window(self.hwnd)
-            sys32.set_window_topmost(self.hwnd)
-            self.raise_()
-            self.update_app_buttons()
-            log.info("dock栏已恢复显示")
-        except Exception as e:
-            log.error(f"恢复dock栏显示时出错: {e}")
-
-    def hide_dock(self):
-        """将 dock 栏隐藏（真正的 ShowWindow SW_HIDE）。仅在可见时执行。"""
-        if self._hidden_by_fullscreen or self.hwnd is None:
-            return
-        try:
-            self._hidden_by_fullscreen = True
-            sys32.hide_window(self.hwnd)
-            log.info("dock栏已隐藏")
-        except Exception as e:
-            log.error(f"隐藏dock栏时出错: {e}")
+            log.error(f"更新运行进程状态时出错: {e}")
 
     def _ensure_dock_visible(self):
-        """确保 dock 栏处于可见置顶状态（安全恢复方法）。"""
+        """确保 dock 栏处于可见置顶状态（安全恢复方法）。
+
+        系统可能把窗口重新显示出来，此时补一次 ShowWindow + raise_ 即可。
+        """
         if self.hwnd is None:
             return
+        if getattr(self, '_fs_suppressed', False):
+            # 全屏让位期间 dock 本来就该藏着，别在这里把它强行显示回来
+            return
         if not self.isVisible():
-            self._hidden_by_fullscreen = False
             sys32.show_window(self.hwnd)
-            sys32.set_window_topmost(self.hwnd)
             log.info("dock栏已恢复显示（安全恢复）")
+
+    # ------------------------------------------------------------------ #
+    # 全屏程序让位：注销 AppBar + 隐藏 dock（判定规则见 core/fullscreen_watch.py）
+    # ------------------------------------------------------------------ #
+    def _start_fullscreen_watch(self):
+        """启动全屏程序监听线程。"""
+        fs_config = (self.all_settings or {}).get('fullscreen', {}) or {}
+        if not fs_config.get('enabled', True):
+            log.info("全屏程序监听未启用（settings.json: fullscreen.enabled=false）")
+            return
+        try:
+            self._fs_worker = FullscreenWatcherWorker(
+                self.process_manager,
+                interval_ms=_config_int(fs_config.get('poll_interval_ms'),
+                                        DEFAULT_POLL_INTERVAL_MS, 50),
+                enter_confirm=_config_int(fs_config.get('enter_confirm'),
+                                          DEFAULT_ENTER_CONFIRM, 1),
+                exit_confirm=_config_int(fs_config.get('exit_confirm'),
+                                         DEFAULT_EXIT_CONFIRM, 1),
+                tolerance=_config_int(fs_config.get('tolerance'), DEFAULT_TOLERANCE, 0),
+                extra_processes=fs_config.get('except_processes') or (),
+                # 打包后 sys.executable 就是本程序；源码运行时它是 python.exe，
+                # 这时不能按进程名排除自己，否则 pygame 之类用 python 跑的全屏
+                # 程序会被一起放过（dock 自己的窗口另有 hwnd 兜底）。
+                own_process_name=(os.path.basename(sys.executable)
+                                  if getattr(sys, 'frozen', False) else ""),
+            )
+            self._fs_worker.state_changed.connect(self._on_fullscreen_state_changed)
+            self._fs_worker.scan_failed.connect(self._on_fullscreen_scan_failed)
+            self._sync_fullscreen_ignored_windows()
+            self._fs_thread_id = self.thread_manager.create(
+                name="dock_fullscreen_watch",
+                start_when_create=True,
+                worker=self._fs_worker,
+            )
+            log.info("全屏程序监听已启动")
+        except Exception as e:
+            # 线程管理器有数量上限（默认 16），注册失败不该影响 dock 本体
+            log.warning(f"启动全屏程序监听失败: {e}")
+            self._fs_worker = None
+            self._fs_thread_id = None
+
+    def _stop_fullscreen_watch(self):
+        """停止全屏程序监听，并把 dock 从挂起态恢复回来。
+
+        设置界面里关掉开关时走到这里；先停线程再恢复，避免恢复过程中又被新的
+        检测结果按回挂起态。
+        """
+        worker = getattr(self, '_fs_worker', None)
+        thread_id = getattr(self, '_fs_thread_id', None)
+        self._fs_worker = None
+        self._fs_thread_id = None
+        try:
+            if thread_id and hasattr(self, 'thread_manager'):
+                self.thread_manager.destroy(thread_id)
+            elif worker is not None:
+                worker.stop()
+        except Exception as e:
+            log.warning(f"停止全屏程序监听失败: {e}")
+        finally:
+            self.exit_fullscreen_suppression()
+            log.info("全屏程序监听已停止")
+
+    def _sync_fullscreen_ignored_windows(self):
+        """把 dock 自己的窗口句柄告诉监听线程（永远不会被当成全屏程序）。"""
+        worker = getattr(self, '_fs_worker', None)
+        if worker is None:
+            return
+        try:
+            worker.set_ignored_hwnds([self.hwnd] if self.hwnd else [])
+        except Exception as e:
+            log.debug(f"同步忽略窗口失败: {e}")
+
+    def _on_fullscreen_scan_failed(self, message):
+        """监听线程的检测异常（只记录，不打断界面）。"""
+        log.error(f"全屏程序检测失败: {message}")
+
+    def _on_fullscreen_state_changed(self, is_fullscreen, description):
+        """监听线程报来的状态翻转（信号已排队到 GUI 线程）。"""
+        if is_fullscreen:
+            self.enter_fullscreen_suppression(description)
+        else:
+            self.exit_fullscreen_suppression()
+
+    def enter_fullscreen_suppression(self, description=""):
+        """有非系统程序全屏显示：注销 AppBar 并隐藏 dock。
+
+        顺序是「先注销 AppBar，再隐藏窗口」。AppBar 的宿主窗口是另一个隐藏窗口
+        （见 core/sys32.py），所以两步互不依赖；先注销是为了让工作区尽早还给
+        全屏窗口，不给它留一帧被保留区挤压的机会。
+
+        两步各自兜异常：任何一步失败都不能让状态卡住——真出错时至少用户还能正常
+        用他的全屏程序。
+        """
+        if getattr(self, '_fs_suppressed', False):
+            return
+        self._fs_suppressed = True
+        self._fs_last_description = description or ""
+        log.info(f"[全屏] 检测到全屏程序 {description or '(未知)'}：注销 AppBar 并隐藏 dock")
+
+        # 提示条是独立的置顶窗口，不主动收起会残留在全屏画面上
+        try:
+            self.hide_icon_tooltip()
+        except Exception as e:
+            log.debug(f"隐藏图标提示时出错: {e}")
+
+        try:
+            if sys32.is_appbar_registered():
+                sys32.remove_appbar()
+        except Exception as e:
+            log.error(f"注销 AppBar 失败: {e}")
+
+        try:
+            self.hide()
+        except Exception as e:
+            log.error(f"隐藏 dock 窗口失败: {e}")
+
+    def exit_fullscreen_suppression(self):
+        """全屏程序已退出：重新注册 AppBar 并显示 dock。"""
+        if not getattr(self, '_fs_suppressed', False):
+            return
+        self._fs_suppressed = False
+        log.info(f"[全屏] 全屏程序已退出（{self._fs_last_description or '未知'}）："
+                 "重新注册 AppBar 并显示 dock")
+
+        # 挂起期间可能换过显示器/分辨率，重新注册前先按最新指标算一次
+        try:
+            sys32.refresh_metrics()
+            screen = QApplication.primaryScreen()
+            dpr = screen.devicePixelRatio() if screen is not None else 1.0
+            sys32.set_appbar_bottom(round(self._dock_target_y() * dpr))
+        except Exception as e:
+            log.error(f"重新注册 AppBar 失败: {e}")
+
+        try:
+            # 挂起期间按钮可能增减过，清掉动画目标让 update_window_position 重新算
+            self._geom_anim_target = None
+            self.update_window_position()
+            self.show()
+            self._ensure_dock_visible()
+        except Exception as e:
+            log.error(f"恢复 dock 显示失败: {e}")
+        finally:
+            self._fs_last_description = ""
+
+    def _dock_target_y(self):
+        """dock 顶端的逻辑 Y 坐标（= 注册 AppBar 前的工作区底部 - 窗口高度）。
+
+        和 :meth:`update_window_position` 用同一个算式，保证"重新注册 AppBar 的
+        位置"与"窗口实际位置"始终一致；这里读的是启动时保存的原始工作区底部，
+        所以反复注销/注册不会累积漂移。
+        """
+        work_bottom = getattr(self, '_original_work_area_bottom', 0)
+        if not work_bottom:
+            screen = QApplication.primaryScreen()
+            work_bottom = screen.availableGeometry().bottom() if screen is not None else 0
+        window_height = DockConstants.ICON_SIZE + DockConstants.WINDOW_MARGIN * 2
+        return work_bottom - window_height
 
 
     def handle_app_click(self, app_data):
@@ -584,7 +634,7 @@ class DockApp(QMainWindow):
 
     def init_ui(self):
         """初始化用户界面"""
-        self.setWindowTitle("301-02 Dock")
+        self.setWindowTitle("MikaDock")
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.ToolTip)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.installEventFilter(self)
@@ -652,7 +702,6 @@ class DockApp(QMainWindow):
         self.content_layout.addWidget(self.app_container, 1)
         self.content_layout.addWidget(self.running_separator)
         self.content_layout.addWidget(self.running_app_container)
-
         # 添加设置按钮
         settings_layout = QHBoxLayout()
         settings_layout.addStretch()
@@ -666,6 +715,18 @@ class DockApp(QMainWindow):
         self.main_layout.addLayout(self.content_layout)
         self.init_tooltip()
 
+    def start_xht(self):
+        """创建并显示小黑条窗口。
+
+        把 dock 的线程管理器传进去，通知监听线程就会登记在同一处，退出时一起收尾。
+        """
+        self.xht_window = XHTWindow.Window(
+            config=self.all_settings.get("xht"),
+            elements=self.xhtelements,
+            logger=log,
+            thread_manager=self.thread_manager,
+        )
+        self.xht_window.show()
 
     def update_window_position(self):
         """更新窗口位置 - 根据应用数量自动调整宽度（使用动画平滑过渡）"""
@@ -731,17 +792,23 @@ class DockApp(QMainWindow):
         current_rect = self.geometry()
         if current_rect == target_rect:
             return
-        
-        # 停止并丢弃已有动画（如果存在）
-        if self.geometry_anim is not None and isinstance(self.geometry_anim, QPropertyAnimation):
-            try:
-                self.geometry_anim.stop()
-            except Exception as e:
-                log.debug(f"停止几何动画时出错: {e}")
-        
-        # 创建新动画并保存引用，避免被回收
-        self.geometry_anim = QPropertyAnimation(self, b"geometry", self)
-        self.geometry_anim.setDuration(220)  # 毫秒，短时平滑过渡
+
+        # 目标矩形没变过就不重启动画：进程轮询每 500ms 会走到这里，反复
+        # stop()/start() 会让窗口一直停在动画中途，看上去就是持续抖动。
+        if getattr(self, '_geom_anim_target', None) == target_rect:
+            return
+        self._geom_anim_target = target_rect
+
+        # 复用同一个动画对象，避免每次重建（下同：只在缺失时创建）
+        if not isinstance(self.geometry_anim, QPropertyAnimation):
+            self.geometry_anim = QPropertyAnimation(self, b"geometry", self)
+            self.geometry_anim.setDuration(DockConstants.GEOMETRY_ANIM_DURATION)
+            self.geometry_anim.setEasingCurve(QEasingCurve.OutCubic)
+
+        try:
+            self.geometry_anim.stop()
+        except Exception as e:
+            log.debug(f"停止几何动画时出错: {e}")
         self.geometry_anim.setStartValue(current_rect)
         self.geometry_anim.setEndValue(target_rect)
         self.geometry_anim.setEasingCurve(QEasingCurve.OutCubic)
@@ -814,54 +881,23 @@ class DockApp(QMainWindow):
 
 
     def init_tooltip(self):
-        self.tooltip = QLabel("", None)
-        self.tooltip.setObjectName("DockIconTooltip")
-        flags = Qt.ToolTip | Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint
-        self.tooltip.setWindowFlags(flags)
-        self.tooltip.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.tooltip.setStyleSheet(f"""
-            QLabel#DockIconTooltip {{
-                color: white;
-                font-family: 'Microsoft YaHei UI';
-                font-weight: Medium;
-                font-size: 14px;
-                background-color: {DockConstants.COLOR_TOOLTIP};
-                border-radius: 5px;
-                padding: 8px 16px;
-            }}
-        """)
-        self.tooltip.hide()
+        """创建图标悬浮提示条（实现见 core/dock_tooltip.py）。"""
+        self.tooltip = DockTooltip(None)
 
     def show_icon_tooltip(self, button, text):
-        if not text:
-            return
-        self.tooltip.setText(text)
-        self.tooltip.adjustSize()
-        self.update_icon_tooltip_position(button)
-        self.tooltip.show()
+        tooltip = getattr(self, 'tooltip', None)
+        if tooltip is not None:
+            tooltip.show_for(button, text)
 
     def hide_icon_tooltip(self):
-        if hasattr(self, 'tooltip') and self.tooltip.isVisible():
-            self.tooltip.hide()
+        tooltip = getattr(self, 'tooltip', None)
+        if tooltip is not None:
+            tooltip.hide_tip()
 
     def update_icon_tooltip_position(self, button):
-        # 将 tooltip 居中放在图标上方，距离 8 像素
-        if not hasattr(self, 'tooltip') or not button:
-            return
-        global_center = button.mapToGlobal(QPoint(button.width()//2, 0))
-        tw = self.tooltip.width()
-        th = self.tooltip.height()
-        x = global_center.x() - tw//2
-        y = global_center.y() - th - 8
-        # 限制在主屏幕工作区内
-        screen_rect = QApplication.primaryScreen().availableGeometry()
-        if x < screen_rect.left():
-            x = screen_rect.left() + 4
-        if x + tw > screen_rect.right():
-            x = screen_rect.right() - tw - 4
-        if y < screen_rect.top():
-            y = global_center.y() + 16  # 放到图标下方
-        self.tooltip.move(x, y)
+        tooltip = getattr(self, 'tooltip', None)
+        if tooltip is not None:
+            tooltip.follow(button)
 
     def clear_layout(self, layout: QHBoxLayout) -> None:
         """清空布局中的所有部件"""
@@ -873,11 +909,10 @@ class DockApp(QMainWindow):
                 widget.setParent(None)
                 widget.deleteLater()
 
-    def _assign_uid(self, app_data: Dict[str, Any]) -> int:
+    def _assign_uid(self, app_data: Dict[str, Any]) -> str:
         """为应用数据分配唯一标识符，确保图标-按钮一对一绑定"""
         if '_uid' not in app_data:
-            self._uid_counter += 1
-            app_data['_uid'] = self._uid_counter
+            app_data['_uid'] = str(uuid.uuid4())
         return app_data['_uid']
 
     def _compute_list_hash(self, app_list: List[Dict[str, Any]]) -> str:
@@ -920,7 +955,7 @@ class DockApp(QMainWindow):
                     log.warning(f"[{name}] 位置 {i} 为空")
                     continue
                 uid = getattr(widget, '_bound_uid', None)
-                if uid is None or uid == 0:
+                if uid is None:
                     log.warning(f"[{name}] 位置 {i} 按钮缺少绑定UID")
                     continue
                 if uid in bound_uids:
@@ -1025,31 +1060,13 @@ class DockApp(QMainWindow):
         popup.show_at_position(pos, sender)
 
     def close_app_window(self, app_data):
-        """关闭应用窗口"""
-        app_path = app_data['path']
-        app_filename = os.path.basename(app_path)
-        
-        def enum_windows_proc(hwnd, param):
-            if win32gui.IsWindowVisible(hwnd):
-                try:
-                    # 获取窗口的进程ID
-                    _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                    proc = psutil.Process(pid)
-                    
-                    # 检查进程名称是否匹配
-                    if proc.name().lower() == app_filename.lower():
-                        # 检查窗口标题是否为空（避免关闭系统窗口）
-                        window_title = win32gui.GetWindowText(hwnd)
-                        if window_title.strip() != '':
-                            # 尝试优雅地关闭窗口
-                            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
-                            log.info(f"已发送关闭命令到窗口: {window_title}")
-                            return False  # 找到并处理了窗口，停止枚举
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                    return True  # 继续枚举其他窗口
+        """关闭应用窗口。
 
+        实现收敛到 :meth:`ProcessManager.close_app_window`（按完整路径匹配，
+        不会因为同名 exe 误关别的进程），这里只负责关完再刷新一次状态。
+        """
         try:
-            win32gui.EnumWindows(enum_windows_proc, 0)
+            self.process_manager.close_app_window(app_data['path'])
             # 延迟检查进程状态
             QTimer.singleShot(1000, self.check_running_processes)
         except Exception as e:
@@ -1063,7 +1080,9 @@ class DockApp(QMainWindow):
         )
 
         if reply == sys32.IDYES:
-            self.apps.remove(app_data)
+            # 按路径（稳定标识）删除，避免对象/内容比较失败导致 ValueError
+            app_path = app_data.get('path')
+            self.apps = [a for a in self.apps if a.get('path') != app_path]
             # 如果应用正在运行，从运行列表中移除
             if app_data['name'] in self.running_apps:
                 del self.running_apps[app_data['name']]
@@ -1124,7 +1143,8 @@ class DockApp(QMainWindow):
         """设置保存后的回调"""
         dock_config = config_data.get('dock', {})
         except_list = dock_config.get('except_processes', [])
-        if except_list and hasattr(self, 'process_manager') and self.process_manager:
+        # 空列表是有效意图（用户主动清空排除列表），所以这里不做真值判断
+        if hasattr(self, 'process_manager') and self.process_manager:
             try:
                 self.process_manager.set_except_processes(except_list)
             except Exception:
@@ -1142,10 +1162,39 @@ class DockApp(QMainWindow):
         else:
             self.is_cmd_disabled = False
 
+        # XHT 的通知提示等设置即时生效，不必重启
+        xht_config = config_data.get('xht')
+        if xht_config and getattr(self, 'xht_window', None) is not None:
+            try:
+                self.xht_window.config = xht_config
+                self.xht_window.RefreshConfig()
+                log.info("XHT 配置已刷新")
+            except Exception as e:
+                log.warning(f"刷新 XHT 配置失败: {e}")
+
+        # 全屏让位设置同样即时生效（开关会启停监听线程，排除列表直接更新）
+        self._apply_fullscreen_settings(config_data.get('fullscreen') or {})
+
         log.info("设置已更新")
+
+    def _apply_fullscreen_settings(self, fs_config):
+        """把设置界面里的全屏让位配置应用到运行中的监听线程。"""
+        enabled = bool(fs_config.get('enabled', True))
+        if enabled and getattr(self, '_fs_worker', None) is None:
+            self._start_fullscreen_watch()
+        elif not enabled and getattr(self, '_fs_worker', None) is not None:
+            self._stop_fullscreen_watch()
+        elif getattr(self, '_fs_worker', None) is not None:
+            try:
+                self._fs_worker.set_extra_processes(fs_config.get('except_processes') or ())
+                log.info("全屏让位排除列表已刷新")
+            except Exception as e:
+                log.warning(f"刷新全屏让位排除列表失败: {e}")
 
     def load_settings(self):
         try:
+            # 确保配置文件存在（不存在时写入默认配置）
+            Config.check(self.settings_file)
             self.all_settings = Config.load_config(self.settings_file)
             if self.all_settings.get('nocmd_mode', False):
                 log.warning("cmd被禁用")
@@ -1157,9 +1206,10 @@ class DockApp(QMainWindow):
             dock_config = self.all_settings.get('dock', {})
             self.apps = dock_config.get('apps', [])
             
-            # 加载 ProcessManager 的排除进程设置（如存在）
+            # 加载 ProcessManager 的排除进程设置
+            # （load_config 已保证该键存在，空列表 = 用户清空了排除列表）
             except_list = dock_config.get('except_processes', [])
-            if except_list and hasattr(self, 'process_manager') and self.process_manager:
+            if hasattr(self, 'process_manager') and self.process_manager:
                 try:
                     self.process_manager.set_except_processes(except_list)
                 except Exception:
@@ -1219,9 +1269,15 @@ class DockApp(QMainWindow):
         try:
             import features.process_mgr as process_mgr
             if self.is_cmd_disabled:
-                self.process_mgr = process_mgr.ProcessCollectorWorker()
-                process_mgr_id = self.thread_manager.create(name=self.process_mgr.get_name(), start_when_create=True, worker=self.process_mgr)
-                process_mgr.run(collector=self.process_mgr)
+                # 复用已存在的采集线程与窗口，避免重复创建（ThreadManager 上限 16）
+                if self._process_mgr_worker is None:
+                    self._process_mgr_worker = process_mgr.ProcessCollectorWorker()
+                    self._process_mgr_thread_id = self.thread_manager.create(
+                        name=self._process_mgr_worker.get_name(),
+                        start_when_create=True,
+                        worker=self._process_mgr_worker,
+                    )
+                process_mgr.run(collector=self._process_mgr_worker)
             else:
                 subprocess.run(["taskmgr.exe"])
         except Exception as e:
@@ -1267,6 +1323,24 @@ class DockApp(QMainWindow):
             # 注销 AppBar，恢复原始工作区
             sys32.remove_appbar()
 
+            # 先显式停掉进程扫描线程：它跑的是自己的 while 循环，显式 stop() 比
+            # 依赖 stop_all() 更确定（注册失败退化直启时 stop_all 并不知道它）。
+            scan_worker = getattr(self, '_scan_worker', None)
+            if scan_worker is not None:
+                try:
+                    scan_worker.stop()
+                except Exception as e:
+                    log.error(f"停止进程扫描线程时出错: {e}")
+
+            # 全屏监听同理；并且要先让它停止发信号，避免退出过程中又去动 AppBar
+            fs_worker = getattr(self, '_fs_worker', None)
+            if fs_worker is not None:
+                try:
+                    fs_worker.stop()
+                except Exception as e:
+                    log.error(f"停止全屏监听线程时出错: {e}")
+            self._fs_worker = None
+
             # 使用统一的线程管理器停止所有后台服务
             if hasattr(self, 'thread_manager') and self.thread_manager:
                 try:
@@ -1274,14 +1348,10 @@ class DockApp(QMainWindow):
                     log.info("所有后台服务已停止")
                 except Exception as e:
                     log.error(f"停止后台服务时出错: {e}")
-            
-            # 停止进程监控定时器
-            if hasattr(self, 'process_timer') and self.process_timer:
-                self.process_timer.stop()
-            
-            # 停止全局快捷键管理器
-            if hasattr(self, 'hotkey_manager') and self.hotkey_manager:
-                self.hotkey_manager.stop()
+
+            # 停止时间更新定时器
+            if hasattr(self, 'time_timer') and self.time_timer:
+                self.time_timer.stop()
 
             # 重启explorer.exe
             sys32.show_window(sys32.HWND_TRAY)
@@ -1302,6 +1372,8 @@ class DockApp(QMainWindow):
         super().showEvent(event)
         if self.hwnd is None:
             self.hwnd = int(self.winId())
+            # dock 自己的窗口永远不该被当成"全屏程序"
+            self._sync_fullscreen_ignored_windows()
         else:
             # 窗口被系统恢复显示时，确保 Topmost 层级正确
             self._ensure_dock_visible()
@@ -1310,8 +1382,9 @@ class DockApp(QMainWindow):
 def main():
     sys32.hide_window(sys32.HWND_TRAY)
     app = QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(False)  # 防止关闭主窗口时退出
-    
+    app.setQuitOnLastWindowClosed(False)  # 防止关闭主窗口时退出应用
+    app.setApplicationName("MikaDock")
+
     dock = DockApp()
     dock.show()
     sys.exit(app.exec())

@@ -5,27 +5,42 @@ import win32con
 import os
 import sys
 import hashlib
+import time
 
-import core.sys32 as sys32
 from . import make_app_icon
 from . import log_maker
+from . import config_manager
 
 log = log_maker.logger()
 
 
 class ProcessManager:
+    #: 输入法候选框之类的窗口不算「应用的可见窗口」
+    _IGNORED_WINDOW_CLASSES = frozenset([
+        "MSCTFIME UI", "IAIMETIPWndClass", "TIPBand", "Candidate",
+    ])
+
+    #: pid -> (exe, name) 短 TTL 缓存：轮询间隔 500ms，取 1 秒既覆盖一轮内的重复
+    #: 查询，又不会因为 PID 复用拿到过期结果。
+    _PROC_INFO_TTL = 1.0
+    _PROC_INFO_MAX = 512
+
+    #: 图标提取结果缓存的最大条目数（含失败结果的负缓存）
+    _ICON_CACHE_MAX = 512
+
     def __init__(self):
-        self.except_processes = [
-            'shellexperiencehost.exe',
-            'applicationframehost.exe',
-            'startmenuexperiencehost.exe',
-            'widgets.exe',
-            'widgetservice.exe',
-            'SystemSettings.exe',
-            'TextInputHost.exe'
-        ]
+        # 排除进程的默认值只在 config_manager.DEFAULT_CONFIG 里定义一次，
+        # 避免这里再硬编码一份导致两处漂移（历史上就漏了 python.exe / wetype_*）。
+        self.except_processes = list(
+            config_manager.DEFAULT_CONFIG["dock"]["except_processes"]
+        )
         # lazy extractor instance (复用 CatchIco 提取器，避免频繁创建)
         self._extractor = None
+        # pid -> (exe_path, name, 记录时刻)：见 _proc_info_for_pid
+        self._proc_info_cache = {}
+        # 图标提取结果的进程内缓存：命中可直接跳过磁盘判断与 GDI 提取，
+        # 值可能是路径字符串，也可能是 None（表示提取失败，做负缓存避免反复重试）
+        self._icon_cache = {}
         try:
             from .catch_ico import WindowsIconExtractor
             # 不立即实例化过重资源，延迟在需要时创建
@@ -39,14 +54,24 @@ class ProcessManager:
         except Exception:
             return str(p).lower()
 
+    def norm_path(self, p):
+        """规范化路径用于比较（公开接口）。
+
+        调用方（例如 dock.py）需要同一套比较规则，不该去碰带下划线的私有方法。
+        """
+        return self._norm_path(p)
+
     def set_except_processes(self, proc_list):
         """
         更新排除进程列表（用户可通过设置界面调用）。
         规范化为小写、去重、每项尽量带 .exe（若用户只写了进程名则自动补 .exe）。
+
+        传 ``None`` 表示「不改动」；传空列表表示「清空排除列表」—— 在设置界面
+        把输入框全部删空是一个明确的意图，不该和「没配置」混为一谈。
         """
+        if proc_list is None:
+            return
         try:
-            if not proc_list:
-                return
             normalized = []
             for s in proc_list:
                 if not s:
@@ -61,8 +86,7 @@ class ProcessManager:
                     s = s + '.exe'
                 if s not in normalized:
                     normalized.append(s)
-            if normalized:
-                self.except_processes = normalized
+            self.except_processes = normalized
         except Exception as e:
             log.error(f"设置排除进程列表时出错: {e}")
 
@@ -74,48 +98,97 @@ class ProcessManager:
                 self._extractor = None
         return self._extractor
 
+    # ------------------------------------------------------------------ #
+    # 进程 / 窗口信息缓存
+    # ------------------------------------------------------------------ #
+    def _proc_info_for_pid(self, pid):
+        """返回 ``(exe_path, name_lower)``，失败时为 ``(None, '')``。
+
+        走一个短 TTL 缓存：同一轮轮询里 ``is_process_running`` /
+        ``get_app_visible_windows`` / ``get_running_processes`` 会对同一个 pid
+        反复调用 psutil，而每次 ``exe()`` / ``name()`` 都要走一次系统调用，是这些
+        查询的主要开销。TTL 取 1 秒（轮询间隔 500ms），既覆盖了一轮内的重复查询，
+        又不会因为 PID 复用而拿到过期结果。
+        """
+        now = time.monotonic()
+        cached = self._proc_info_cache.get(pid)
+        if cached is not None and (now - cached[2]) < self._PROC_INFO_TTL:
+            return cached[0], cached[1]
+
+        exe_path = None
+        name = ''
+        try:
+            proc = psutil.Process(pid)
+            exe_path = proc.exe()
+            name = (proc.name() or '').lower()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+        except Exception as e:
+            log.debug(f"解析进程 {pid} 信息失败: {e}")
+
+        self._proc_info_cache[pid] = (exe_path, name, now)
+        if len(self._proc_info_cache) > self._PROC_INFO_MAX:
+            # 先清过期项；仍然超限就直接重建，避免长期运行时无限增长
+            for key, value in list(self._proc_info_cache.items()):
+                if (now - value[2]) >= self._PROC_INFO_TTL:
+                    del self._proc_info_cache[key]
+            if len(self._proc_info_cache) > self._PROC_INFO_MAX:
+                self._proc_info_cache.clear()
+        return exe_path, name
+
+    def proc_info_for_pid(self, pid):
+        """公开接口：``pid -> (exe_path, name_lower)``，走同一份 TTL 缓存。
+
+        调用方（例如 :mod:`core.fullscreen_watch`）需要"这个窗口属于哪个进程"，
+        必须复用同一份缓存，否则每次前台窗口变化都要额外走一次 psutil。
+        """
+        return self._proc_info_for_pid(pid)
+
+    def _enum_visible_windows(self):
+        """一次性枚举所有「可见且有标题」的窗口，返回 ``pid -> [(hwnd, 标题, 类名)]``。
+
+        ``EnumWindows`` 是 is_process_running / get_app_visible_windows /
+        get_running_processes 三个方法的共同成本大头，集中到一处，避免每个方法
+        各自完整枚举一遍。
+        """
+        pid_windows = {}
+
+        def _collect(hwnd, _param):
+            try:
+                if win32gui.IsWindow(hwnd) and win32gui.IsWindowVisible(hwnd):
+                    title = win32gui.GetWindowText(hwnd)
+                    if title and title.strip():
+                        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                        pid_windows.setdefault(pid, []).append(
+                            (hwnd, title, win32gui.GetClassName(hwnd))
+                        )
+            except Exception:
+                pass
+            return True
+
+        try:
+            win32gui.EnumWindows(_collect, None)
+        except Exception as e:
+            log.debug(f"枚举窗口失败: {e}")
+        return pid_windows
+
     def is_process_running(self, app_path):
         """检查指定路径的应用是否正在运行 - 仅当有可见窗口时"""
         try:
             normalized_app = self._norm_path(app_path)
             current_process_name = os.path.basename(sys.executable).lower()
-            
-            # 遍历所有窗口，查找与应用路径匹配的窗口
-            def enum_windows_proc(hwnd, param):
-                if not win32gui.IsWindowVisible(hwnd) or win32gui.GetWindowText(hwnd) == '':
-                    return True  # 跳过不可见或无标题窗口
-                    
-                try:
-                    # 获取窗口的进程ID
-                    _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                    proc = psutil.Process(pid)
-                    
-                    # 获取进程信息
-                    proc_path = proc.exe()
-                    process_name = proc.name().lower()
-                    
-                    # 跳过排除列表中的进程和程序本身
-                    if process_name in self.except_processes or process_name == current_process_name:
-                        return True
-                    
-                    # 比较路径是否匹配
-                    if self._norm_path(proc_path) == normalized_app:
-                        param.append(True)  # 找到匹配的窗口
-                        return False  # 停止遍历
-                        
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                    pass  # 忽略无法访问的进程
-                except Exception as e:
-                    log.debug(f"检查窗口 {hwnd} 时出错: {e}")
-                    
-                return True  # 继续遍历
-            
-            result = []
-            win32gui.EnumWindows(enum_windows_proc, result)
-            
-            # 只有当找到对应窗口时才认为应用正在运行
-            return len(result) > 0
-            
+
+            for pid in self._enum_visible_windows():
+                exe_path, name = self._proc_info_for_pid(pid)
+                if not exe_path:
+                    continue
+                # 跳过排除列表中的进程和程序本身
+                if name in self.except_processes or name == current_process_name:
+                    continue
+                if self._norm_path(exe_path) == normalized_app:
+                    return True
+            return False
+
         except Exception as e:
             log.error(f"检查窗口时出错: {e}")
             return False
@@ -129,39 +202,27 @@ class ProcessManager:
         """
         running_processes = {}
         try:
-            # 先一次性枚举所有可见窗口，建立 pid -> visible-window-info 映射（提升性能）
-            pid_windows = {}
-            def _collect_windows(hwnd, param):
-                try:
-                    if win32gui.IsWindow(hwnd) and win32gui.IsWindowVisible(hwnd):
-                        _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                        title = win32gui.GetWindowText(hwnd)
-                        if title and title.strip():
-                            pid_windows.setdefault(pid, []).append((hwnd, title, win32gui.GetClassName(hwnd)))
-                except Exception:
-                    pass
-                return True
-            try:
-                win32gui.EnumWindows(_collect_windows, None)
-            except Exception:
-                pass
+            # 一次性枚举所有可见窗口，建立 pid -> visible-window-info 映射
+            pid_windows = self._enum_visible_windows()
 
             # 规范化已知应用路径，避免重复检查
             normalized_known_paths = {self._norm_path(p) for p in known_apps_paths}
             current_process_name = os.path.basename(sys.executable).lower()
 
             # 现在遍历进程并快速判断
-            for proc in psutil.process_iter(['pid', 'name', 'exe', 'cmdline']):
+            # 注意：这里刻意不请求 'cmdline' —— 解析每个进程的命令行代价很高，
+            # 而下面全程都没有用到它。
+            for proc in psutil.process_iter(['pid', 'name', 'exe']):
                 try:
                     process_info = proc.info
                     exe_path = process_info.get('exe')
-                    
+
                     # 基本过滤
                     if not exe_path or not os.path.exists(exe_path):
                         continue
 
                     # 检查进程名称是否在排除列表中
-                    process_name = process_info.get('name', '').lower()
+                    process_name = (process_info.get('name') or '').lower()
                     if process_name in self.except_processes or process_name == current_process_name:
                         continue  # 跳过排除列表和程序自身
 
@@ -171,12 +232,8 @@ class ProcessManager:
                         continue  # 没有可见窗口，跳过
 
                     # 过滤特殊类名的窗口
-                    valid_window_found = False
-                    for hwnd, title, cls in windows:
-                        if cls not in ["MSCTFIME UI", "IAIMETIPWndClass", "TIPBand", "Candidate"]:
-                            valid_window_found = True
-                            break
-                    if not valid_window_found:
+                    if not any(cls not in self._IGNORED_WINDOW_CLASSES
+                               for _hwnd, _title, cls in windows):
                         continue
 
                     # 检查是否已知（固定或用户添加）
@@ -184,9 +241,8 @@ class ProcessManager:
                         continue
 
                     if exe_path not in running_processes:
-                        app_name = process_info.get('name', '').replace('.exe', '')
-                        # 使用图标提取函数获取图标（可能为 None）
-                        icon_path = None
+                        app_name = (process_info.get('name') or '').replace('.exe', '')
+                        # 使用图标提取函数获取图标（带进程内缓存，失败结果也会缓存）
                         try:
                             icon_path = self.extract_icon(exe_path) or ''
                         except Exception:
@@ -204,81 +260,59 @@ class ProcessManager:
                     continue
         except Exception as e:
             log.error(f"获取运行进程时出错: {e}")
-        
+
         return running_processes
 
     def get_app_visible_windows(self, app_path):
-        """获取应用的所有可见窗口"""
+        """获取应用的所有可见窗口，返回 ``[(hwnd, 标题), ...]``"""
         try:
-            app_filename = os.path.basename(app_path).lower()
-            
+            normalized_app = self._norm_path(app_path)
+            current_process_name = os.path.basename(sys.executable).lower()
+
             visible_windows = []
-            
-            def enum_windows_proc(hwnd, param):
-                if win32gui.IsWindowVisible(hwnd) and win32gui.GetWindowText(hwnd) != '':
-                    try:
-                        # 获取窗口的进程ID
-                        _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                        proc = psutil.Process(pid)
-                        
-                        # 获取进程的可执行文件路径
-                        proc_path = proc.exe().lower()
-                        normalized_app_path = os.path.abspath(app_path).lower()
-                        
-                        # 比较路径是否匹配
-                        if os.path.abspath(proc_path).lower() == normalized_app_path:
-                            # 检查是否为系统服务或程序本身
-                            process_name = proc.name().lower()
-                            
-                            # 检查是否为系统服务
-                            if process_name in self.except_processes:
-                                return True  # 继续遍历，但不添加到结果中
-                            
-                            # 检查是否为程序本身
-                            current_process_name = os.path.basename(sys.executable).lower()
-                            if process_name == current_process_name.lower():
-                                return True  # 继续遍历，但不添加到结果中
-                            
-                            # 获取窗口标题
-                            window_title = win32gui.GetWindowText(hwnd)
-                            
-                            # 窗口存在且可见，添加到结果列表
-                            param.append((hwnd, window_title))
-                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                        pass
-                    except Exception as e:
-                        log.debug(f"检查窗口 {hwnd} 时出错: {e}")
-                return True  # 继续遍历
-            
-            win32gui.EnumWindows(enum_windows_proc, visible_windows)
-            
+            for pid, windows in self._enum_visible_windows().items():
+                exe_path, name = self._proc_info_for_pid(pid)
+                if not exe_path or self._norm_path(exe_path) != normalized_app:
+                    continue
+                # 跳过排除列表中的系统服务和程序本身
+                if name in self.except_processes or name == current_process_name:
+                    continue
+                for hwnd, title, _cls in windows:
+                    visible_windows.append((hwnd, title))
             return visible_windows
         except Exception as e:
             log.error(f"检查窗口时出错: {e}")
             return []
 
     def close_app_window(self, app_path):
-        """关闭应用窗口"""
-        app_filename = os.path.basename(app_path)
-        
-        def enum_windows_proc(hwnd, param):
+        """关闭应用窗口。
+
+        按**完整路径**匹配进程，避免同名进程（例如两个不同目录下的 chrome.exe）
+        被误关。按文件名匹配的老实现在 ``dock.py`` 里还有一份，这里保留单一实现
+        供调用方复用。
+        """
+        normalized_app = self._norm_path(app_path)
+        current_process_name = os.path.basename(sys.executable).lower()
+
+        def enum_windows_proc(hwnd, _param):
             if win32gui.IsWindowVisible(hwnd):
                 try:
-                    # 获取窗口的进程ID
                     _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                    proc = psutil.Process(pid)
-                    
-                    # 检查进程名称是否匹配
-                    if proc.name().lower() == app_filename.lower():
-                        # 检查窗口标题是否为空（避免关闭系统窗口）
-                        window_title = win32gui.GetWindowText(hwnd)
-                        if window_title.strip() != '':
-                            # 尝试优雅地关闭窗口
-                            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
-                            log.info(f"已发送关闭命令到窗口: {window_title}")
-                            return False  # 找到并处理了窗口，停止枚举
+                    exe_path, name = self._proc_info_for_pid(pid)
+                    if not exe_path or self._norm_path(exe_path) != normalized_app:
+                        return True
+                    if name in self.except_processes or name == current_process_name:
+                        return True
+                    # 检查窗口标题是否为空（避免关闭系统窗口）
+                    window_title = win32gui.GetWindowText(hwnd)
+                    if window_title.strip():
+                        win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                        log.info(f"已发送关闭命令到窗口: {window_title}")
+                        return False  # 找到并处理了窗口，停止枚举
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     pass
+                except Exception as e:
+                    log.debug(f"关闭窗口 {hwnd} 时出错: {e}")
             return True  # 继续枚举其他窗口
 
         try:
@@ -318,7 +352,37 @@ class ProcessManager:
             log.error(f"终止应用进程时出错: {e}")
             
     def extract_icon(self, exe_path):
-        """提取图标，使用CatchIco.py中的功能并通过 MakeAppIcon.compose_on_template 生成统一风格图标"""
+        """提取图标并返回缓存 PNG 路径；失败返回 None。
+
+        结果按规范化路径缓存在**内存**里，成功和失败都缓存：
+        * 成功：省掉每次 ``os.path.exists`` + 可能的 GDI 提取；
+        * 失败：负缓存。图标提取对某些 exe 必然失败（无图标资源、UWP 存根等），
+          不缓存的话每次轮询都会重新走一遍昂贵的提取流程。
+
+        需要重新提取时调用 :meth:`invalidate_icon_cache`。
+        """
+        if not exe_path:
+            return None
+        cache_key = self._norm_path(exe_path)
+        if cache_key in self._icon_cache:
+            return self._icon_cache[cache_key]
+
+        icon_path = self._extract_icon_uncached(exe_path)
+
+        if len(self._icon_cache) >= self._ICON_CACHE_MAX:
+            self._icon_cache.clear()
+        self._icon_cache[cache_key] = icon_path
+        return icon_path
+
+    def invalidate_icon_cache(self, exe_path=None):
+        """清空图标内存缓存（传路径只失效那一个）。"""
+        if exe_path is None:
+            self._icon_cache.clear()
+        else:
+            self._icon_cache.pop(self._norm_path(exe_path), None)
+
+    def _extract_icon_uncached(self, exe_path):
+        """真正执行图标提取；使用CatchIco.py并通过 MakeAppIcon.compose_on_template 生成统一风格图标"""
         try:
             # 使用包含路径哈希的缓存名，避免不同路径同名冲突
             cache_dir = os.path.join(os.getenv('LOCALAPPDATA') or os.path.expanduser("~"), 'AppIcon')
@@ -334,128 +398,33 @@ class ProcessManager:
 
             extracted_icon = extractor.extract_file_icon(exe_path, size=64)
             if extracted_icon.success and extracted_icon.image:
+                # 先写临时文件再原子替换。进程扫描线程和界面线程可能同时为同一个
+                # exe 提取图标，直接写同一个目标文件会互相截断，界面上就会读到
+                # 一个写了一半的 PNG（QPixmap 加载失败 → 图标空白）。
+                tmp_path = icon_path + ".tmp"
                 try:
-                    # 优先使用合成库生成统一风格图标
                     try:
-                        composed_bytes = make_app_icon.overlay.compose_on_template(extracted_icon.image)
-                        with open(icon_path, "wb") as f:
+                        # 优先使用合成库生成统一风格图标
+                        composed_bytes = make_app_icon.overlay.compose_on_template(
+                            extracted_icon.image
+                        )
+                        with open(tmp_path, "wb") as f:
                             f.write(composed_bytes)
-                        return icon_path
                     except Exception:
                         # 合成失败则回退为直接保存提取到的图像
-                        extracted_icon.image.save(icon_path)
-                        return icon_path
+                        # （显式指定 PNG：临时文件后缀不会被 PIL 识别）
+                        extracted_icon.image.save(tmp_path, format="PNG")
+                    os.replace(tmp_path, icon_path)
+                    return icon_path
                 except Exception as e:
                     log.error(f"保存/合成图标时出错: {e}")
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
                     return None
             else:
                 return None
         except Exception as e:
             log.error(f"使用图标提取器出错: {e}")
             return None
-
-    def is_window_fullscreen(self, hwnd) -> bool:
-        """判断给定窗口句柄是否在主显示器上处于全屏状态。
-
-        采用双重检测策略：
-        1. 窗口矩形精确匹配主显示器工作区（排除任务栏）→ 匹配无边框最大化
-        2. 检查 WS_POPUP 样式（无标题栏/边框）且覆盖全屏 → 匹配真正的全屏应用
-        """
-        try:
-            if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
-                return False
-
-            rect = sys32.get_window_rect(hwnd)
-
-            # 策略1：窗口矩形精确匹配工作区（排除任务栏区域）
-            if (rect[0] == sys32.PRIMARY_WORK_LEFT
-                    and rect[1] == sys32.PRIMARY_WORK_TOP
-                    and rect[2] == sys32.PRIMARY_WORK_RIGHT
-                    and rect[3] == sys32.PRIMARY_WORK_BOTTOM):
-                return True
-
-            # 策略2：WS_POPUP 样式（无边框）且覆盖整个物理屏幕
-            # WS_POPUP = 0x800000, WS_CHILD = 0x40000000
-            style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
-            is_popup = bool(style & 0x00800000) and not bool(style & 0x40000000)
-            if is_popup:
-                # 窗口从屏幕原点开始，覆盖整个物理屏幕
-                if (abs(rect[0]) <= 1 and abs(rect[1]) <= 1
-                        and abs(rect[2] - sys32.REAL_SCREEN_WIDTH) <= 1
-                        and abs(rect[3] - sys32.REAL_SCREEN_HEIGHT) <= 1):
-                    log.info(f"[WS_POPUP全屏] hwnd={hwnd} 样式=0x{style:08X} "
-                             f"窗口=({rect[0]},{rect[1]},{rect[2]},{rect[3]})")
-                    return True
-
-            return False
-        except Exception:
-            return False
-
-    def get_fullscreen_windows(self):
-        """获取所有在主显示器上全屏的窗口句柄列表，忽略系统窗口。"""
-        fullscreen_windows = []
-
-        # 系统窗口类名黑名单
-        system_classes = frozenset([
-            "Progman", "WorkerW", "Shell_TrayWnd",
-            "Windows.UI.Core.CoreWindow", "EdgeUiInputWndClass",
-            "ImmersiveLauncher", "ApplicationFrameWindow",
-            "MsgrHTMLWndClass", "Internet Explorer_Hidden",
-            "MSCTFIME UI", "TrayNotifyWnd", "DV2ControlHost",
-            "NativeHWNDHost", "ToolbarWindow32", "ReBarWindow32",
-            "MSTaskSwWClass", "Shell_SecondaryTrayWnd",
-            "SysListView32", "DirectUIHWND", "Breadcrumb Parent",
-            "Search Box", "SearchEditBox", "SearchDialog",
-        ])
-
-        # 系统窗口标题黑名单（子串匹配）
-        system_title_parts = frozenset([
-            "Program Manager", "Windows Shell Experience Host",
-            "Start", "Settings", "Microsoft Text Input Application",
-            "Cortana", "Search", "通知", "Action Center", "Windows Explorer",
-        ])
-
-        def is_system_window(hwnd):
-            """检查窗口是否为系统窗口（桌面、任务栏等）"""
-            try:
-                class_name = win32gui.GetClassName(hwnd)
-                window_title = win32gui.GetWindowText(hwnd)
-
-                if class_name in system_classes:
-                    return True
-
-                for part in system_title_parts:
-                    if part in window_title:
-                        return True
-
-                try:
-                    _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                    proc = psutil.Process(pid)
-                    proc_name = proc.name().lower()
-                    if proc_name == "explorer.exe" and class_name in ("Progman", "WorkerW", "SysListView32"):
-                        return True
-                    if proc_name in self.except_processes:
-                        return True
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                    pass
-                except Exception:
-                    pass
-
-                return False
-            except Exception:
-                return False
-
-        def callback(hwnd, _):
-            try:
-                if not win32gui.IsWindowVisible(hwnd):
-                    return True
-                if is_system_window(hwnd):
-                    return True
-                if self.is_window_fullscreen(hwnd):
-                    fullscreen_windows.append(hwnd)
-            except Exception:
-                pass
-            return True
-
-        win32gui.EnumWindows(callback, None)
-        return fullscreen_windows

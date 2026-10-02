@@ -47,7 +47,7 @@
 ### 安装与导入
 
 ```python
-from Lib.threads.manager import ThreadManager, ThreadPriority, ThreadState
+from core.thread_mgr.manager import ThreadManager, ThreadPriority, ThreadState
 from PySide6.QtCore import QThread
 ```
 
@@ -480,4 +480,19 @@ def print_manager_status(manager):
 2. **内存使用**：每个线程对象占用一定内存，避免创建过多线程
 3. **CPU占用**：线程管理器本身开销很小，主要开销来自工作线程
 4. **同步开销**：使用锁保护内部数据结构，确保线程安全
+
+## 重复启停同一个 worker
+
+同一个 worker 可以 `stop()` 之后再 `run()` 重启（例如「关闭通知 → 再打开通知」）。
+有两点需要 worker 自己配合：
+
+1. **`quit()` 要真的能停**：`stop()` 的流程是 `worker.quit()` → `worker.wait(timeout)`，
+   而 `QThread.quit()` 只对跑事件循环（`exec()`）的线程有效。如果 worker 重写了
+   `run()` 跑自己的循环，请一并重写 `quit()` 去置位停止标志，否则 `wait()` 必然超时，
+   进而走到 `terminate()` 强杀线程。
+2. **重启前要清掉停止标志**：在 `run()` 开头把停止标志复位，否则重启后会立刻退出。
+
+管理器侧已经处理了「上一轮排队的 `finished` 信号在下一轮才被投递」的问题：每次
+`run()` 都会按轮次重新绑定回调，过期信号会被忽略，不会把正在运行的新一轮误标成
+`COMPLETED`。`stop_all()` 也会以「worker 是否真的在跑」为准，不只看状态机。
 

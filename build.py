@@ -19,6 +19,8 @@ PACKAGES = [
     "core.thread_mgr",
     "core.make_app_icon",
     "features",
+    # 通知抓取库（纯标准库实现；随 features 一起打包，这里显式列出以防被漏掉）
+    "features.catch_notify",
 ]
 
 # 第三方包（cx_freeze 会自动检测大部分，这里显式列出可能遗漏的）
@@ -30,7 +32,6 @@ INCLUDES = [
     "PIL",
     "loguru",
     "psutil",
-    "pynput",
     "win32com",
     "win32com.shell",
     "win32con",
@@ -60,6 +61,16 @@ INCLUDES = [
 
 # 需要拷贝的资源文件
 INCLUDE_FILES = []
+
+# 可选：要把 WinRT/COM 数据源也打进包里时，取消下面注释（没有这个 exe 也能正常用
+# 默认的数据库源，所以这里默认不打包）。exe 由 features/catch_notify 的
+# native/build.ps1 编译产出。
+# catch_notify_bridge = ROOT_DIR / "features" / "catch_notify" / "native" / "NotificationBridge.exe"
+# if catch_notify_bridge.exists():
+#     INCLUDE_FILES.append((
+#         str(catch_notify_bridge),
+#         os.path.join("features", "catch_notify", "native", "NotificationBridge.exe"),
+#     ))
 
 # res/ 目录下的资源文件
 res_dir = ROOT_DIR / "res"

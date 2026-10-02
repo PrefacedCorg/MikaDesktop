@@ -2,8 +2,8 @@ PySide6
 Pillow
 loguru
 psutil
-pynput
 pywin32
 requests
 typing_extensions
 BlurWindow
+winsdk

@@ -312,43 +312,7 @@ class WindowsIconExtractor:
             error=f"未找到UWP应用: {app_id}"
         )
     
-    def save_icon(self, 
-                 extracted_icon: ExtractedIcon, 
-                 save_path: Union[str, Path], 
-                 format: Union[str, IconFormat] = 'PNG',
-                 quality: int = 95) -> bool:
-        """
-        保存提取的图标到文件
-        
-        Args:
-            extracted_icon: 提取的图标数据
-            save_path: 保存路径
-            format: 保存格式
-            quality: 保存质量（JPEG格式有效）
-            
-        Returns:
-            bool: 是否保存成功
-        """
-        if not extracted_icon.success or not extracted_icon.image:
-            return False
-        
-        try:
-            if isinstance(format, IconFormat):
-                format = format.name
-            
-            save_path = str(save_path)
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            
-            save_kwargs = {'format': format}
-            if format.upper() == 'JPEG':
-                save_kwargs['quality'] = quality
-            
-            extracted_icon.image.save(save_path, **save_kwargs)
-            return True
-        except Exception as e:
-            warnings.warn(f"保存图标失败: {e}")
-            return False
-    
+
     def get_icon_as_bytes(self, 
                          extracted_icon: ExtractedIcon, 
                          format: Union[str, IconFormat] = 'PNG') -> Optional[bytes]:
@@ -379,38 +343,7 @@ class WindowsIconExtractor:
             warnings.warn(f"获取图标字节数据失败: {e}")
             return None
     
-    def list_icons_in_file(self, 
-                          file_path: Union[str, Path]) -> List[IconInfo]:
-        """
-        列出文件中的所有图标
-        
-        Args:
-            file_path: 文件路径
-            
-        Returns:
-            List[IconInfo]: 图标信息列表
-        """
-        file_path = str(file_path)
-        if not os.path.exists(file_path):
-            return []
-        
-        icons = []
-        index = 0
-        
-        while True:
-            try:
-                # 尝试提取图标
-                result = self._extract_file_icon(file_path, 32, index)
-                if result.success:
-                    icons.append(result.info)
-                    index += 1
-                else:
-                    break
-            except:
-                break
-        
-        return icons
-    
+
     def clear_cache(self) -> None:
         """清除图标缓存"""
         self._icon_cache.clear()
@@ -456,54 +389,59 @@ class WindowsIconExtractor:
             # 使用 ExtractIconEx 获取图标句柄
             large_icons = []
             small_icons = []
-            
-            # 获取大图标和小图标
-            result = win32gui.ExtractIconEx(file_path, icon_index)
-            if result and len(result) == 2:
-                large_icons, small_icons = result
-            
-            if not large_icons and not small_icons:
-                return ExtractedIcon(
-                    image=None,
-                    raw_data=b'',
-                    info=IconInfo(file_path, icon_index, size, size, 32, 'Unknown', 0),
-                    success=False,
-                    error="未找到图标"
+            try:
+                # 获取大图标和小图标
+                result = win32gui.ExtractIconEx(file_path, icon_index)
+                if result and len(result) == 2:
+                    large_icons, small_icons = result
+
+                if not large_icons and not small_icons:
+                    return ExtractedIcon(
+                        image=None,
+                        raw_data=b'',
+                        info=IconInfo(file_path, icon_index, size, size, 32, 'Unknown', 0),
+                        success=False,
+                        error="未找到图标"
+                    )
+
+                # 选择合适的图标句柄
+                hicon = large_icons[0] if large_icons else small_icons[0]
+
+                # 转换为PIL图像
+                image = self._hicon_to_pil(hicon, size)
+
+                # 创建图标信息
+                info = IconInfo(
+                    path=file_path,
+                    index=icon_index,
+                    width=size,
+                    height=size,
+                    bits_per_pixel=32,  # 假设32位
+                    format='ICO',
+                    size_bytes=len(self._pil_to_bytes(image, 'PNG'))
                 )
-            
-            # 选择合适的图标句柄
-            hicon = large_icons[0] if large_icons else small_icons[0]
-            
-            # 转换为PIL图像
-            image = self._hicon_to_pil(hicon, size)
-            
-            # 获取图标信息
-            icon_info = win32gui.GetIconInfo(hicon)
-            
-            # 清理资源
-            for icon in large_icons:
-                win32gui.DestroyIcon(icon)
-            for icon in small_icons:
-                win32gui.DestroyIcon(icon)
-            
-            # 创建图标信息
-            info = IconInfo(
-                path=file_path,
-                index=icon_index,
-                width=size,
-                height=size,
-                bits_per_pixel=32,  # 假设32位
-                format='ICO',
-                size_bytes=len(self._pil_to_bytes(image, 'PNG'))
-            )
-            
-            return ExtractedIcon(
-                image=image,
-                raw_data=self._pil_to_bytes(image, 'PNG'),
-                info=info,
-                success=True
-            )
-            
+
+                return ExtractedIcon(
+                    image=image,
+                    raw_data=self._pil_to_bytes(image, 'PNG'),
+                    info=info,
+                    success=True
+                )
+            finally:
+                # ExtractIconEx 返回的图标句柄必须销毁，而且要在**所有**路径上销毁：
+                # 原来这句在 _hicon_to_pil 之后，一旦转换抛异常就永远走不到，
+                # 每次失败泄漏两个 GDI 句柄。
+                for icon in large_icons:
+                    try:
+                        win32gui.DestroyIcon(icon)
+                    except Exception:
+                        pass
+                for icon in small_icons:
+                    try:
+                        win32gui.DestroyIcon(icon)
+                    except Exception:
+                        pass
+
         except Exception as e:
             log.warning(f"图标提取失败 [{file_path}]: {e}")
             return ExtractedIcon(
@@ -567,7 +505,7 @@ class WindowsIconExtractor:
         """从扩展名提取图标的内部实现"""
         try:
             # 获取文件类型信息
-            file_type = win32gui.RegQueryValue(
+            file_type = win32api.RegQueryValue(
                 winreg.HKEY_CLASSES_ROOT, 
                 extension
             )
@@ -576,14 +514,14 @@ class WindowsIconExtractor:
                 # 获取默认图标
                 icon_key_path = f"{file_type}\\DefaultIcon"
                 try:
-                    icon_path = win32gui.RegQueryValue(
+                    icon_path = win32api.RegQueryValue(
                         winreg.HKEY_CLASSES_ROOT,
                         icon_key_path
                     )
                 except:
                     # 尝试直接获取扩展名的图标
                     icon_key_path = f"{extension}\\DefaultIcon"
-                    icon_path = win32gui.RegQueryValue(
+                    icon_path = win32api.RegQueryValue(
                         winreg.HKEY_CLASSES_ROOT,
                         icon_key_path
                     )
@@ -648,7 +586,7 @@ class WindowsIconExtractor:
         try:
             # 使用 SHGetFileInfo 获取特殊文件夹图标
             from ctypes import wintypes
-            from ctypes import windll, Structure, POINTER, byref
+            from ctypes import windll, Structure, byref
             
             class SHFILEINFO(Structure):
                 _fields_ = [
@@ -719,38 +657,74 @@ class WindowsIconExtractor:
             )
     
     def _hicon_to_pil(self, hicon, size: int) -> 'Image.Image':
-        """将图标句柄转换为PIL图像"""
+        """将图标句柄转换为PIL图像。
+
+        注意：本方法会创建屏幕 DC / 内存 DC / 兼容位图三类 GDI 对象，全部必须在
+        ``finally`` 里释放。否则每提取一次图标就泄漏一组句柄，长时间运行后进程会
+        因 GDI 句柄耗尽而异常（界面花屏、创建窗口失败等）。
+        """
         ok, err = self._check_deps()
         if not ok:
             raise RuntimeError(err)
-        # 创建内存DC
-        hdc = win32ui.CreateDCFromHandle(win32gui.GetDC(0))
-        hbmp = win32ui.CreateBitmap()
-        hbmp.CreateCompatibleBitmap(hdc, size, size)
-        hdc = hdc.CreateCompatibleDC()
-        hdc.SelectObject(hbmp)
-        
-        # 绘制图标
-        hdc.FillSolidRect((0, 0, size, size), 0xFFFFFF)  # 白色背景
-        win32gui.DrawIconEx(
-            hdc.GetHandleOutput(), 
-            0, 0, hicon, 
-            size, size, 
-            0, None, 
-            win32con.DI_NORMAL
-        )
-        
-        # 转换为PIL Image
-        bmpinfo = hbmp.GetInfo()
-        bmpstr = hbmp.GetBitmapBits(True)
-        
-        image = Image.frombuffer(
-            'RGB',
-            (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
-            bmpstr, 'raw', 'BGRX', 0, 1
-        )
-        
-        return image
+
+        screen_dc_handle = win32gui.GetDC(0)
+        screen_dc = None
+        mem_dc = None
+        bitmap = None
+        previous_bitmap = None
+        try:
+            screen_dc = win32ui.CreateDCFromHandle(screen_dc_handle)
+            # 关键：兼容位图必须按**屏幕 DC** 创建。若在内存 DC 上调用
+            # CreateCompatibleBitmap，得到的是 1bpp 单色位图，取回的数据长度只有
+            # w*h/8，PIL 会报 "not enough image data"，图标提取直接失败。
+            bitmap = win32ui.CreateBitmap()
+            bitmap.CreateCompatibleBitmap(screen_dc, size, size)
+            mem_dc = screen_dc.CreateCompatibleDC()
+            # SelectObject 返回 DC 原本持有的位图，释放前要还原回去
+            previous_bitmap = mem_dc.SelectObject(bitmap)
+
+            # 绘制图标
+            mem_dc.FillSolidRect((0, 0, size, size), 0xFFFFFF)  # 白色背景
+            win32gui.DrawIconEx(
+                mem_dc.GetHandleOutput(),
+                0, 0, hicon,
+                size, size,
+                0, None,
+                win32con.DI_NORMAL
+            )
+
+            # 转换为PIL Image；copy() 让图像脱离 GDI 位图内存，之后即可安全释放
+            bmpinfo = bitmap.GetInfo()
+            bmpstr = bitmap.GetBitmapBits(True)
+            image = Image.frombuffer(
+                'RGB',
+                (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
+                bmpstr, 'raw', 'BGRX', 0, 1
+            )
+            return image.copy()
+        finally:
+            # 释放顺序：还原位图 -> 删除内存 DC -> 删除自建位图 -> 释放屏幕 DC。
+            # 位图必须先脱离 DC 再删除，否则 DeleteObject 会失败。
+            if mem_dc is not None:
+                if previous_bitmap is not None:
+                    try:
+                        mem_dc.SelectObject(previous_bitmap)
+                    except Exception:
+                        pass
+                try:
+                    mem_dc.DeleteDC()
+                except Exception:
+                    pass
+            if bitmap is not None:
+                try:
+                    win32gui.DeleteObject(bitmap.GetHandle())
+                except Exception:
+                    pass
+            if screen_dc_handle:
+                try:
+                    win32gui.ReleaseDC(0, screen_dc_handle)
+                except Exception:
+                    pass
     
     def _pil_to_bytes(self, image: 'Image.Image', format: str = 'PNG') -> bytes:
         """将PIL图像转换为字节数据"""
@@ -840,206 +814,3 @@ class WindowsIconExtractor:
             
         except Exception:
             return None
-
-
-# ====================== 便捷函数 ======================
-
-class SystemIcons:
-    """系统图标ID常量类"""
-    # 标准系统图标
-    APPLICATION = 100
-    DOCUMENT = 1
-    FOLDER = 3
-    FOLDER_OPEN = 4
-    DRIVE_525 = 6
-    DRIVE_35 = 7
-    DRIVE_FIXED = 8
-    DRIVE_NETWORK = 9
-    DRIVE_NETWORK_DISABLED = 10
-    DRIVE_CD = 11
-    DRIVE_RAM = 12
-    WORLD = 15
-    SERVER = 16
-    PRINTER = 17
-    MY_NETWORK = 18
-    FIND = 22
-    HELP = 23
-    SHORTCUT = 29
-    UI_GADGET = 123
-    # Windows特殊图标
-    WARNING = 101
-    QUESTION = 102
-    ERROR = 103
-    INFO = 104
-    SHIELD = 106
-    # Shell32.dll中的图标
-    COMPUTER = 15          # 我的电脑
-    RECYCLE_BIN = 31       # 回收站（空）
-    RECYCLE_BIN_FULL = 32  # 回收站（满）
-    CONTROL_PANEL = 21     # 控制面板
-    NETWORK = 17           # 网络
-    USERS = 109            # 用户文件夹
-
-
-def extract_icon(source: Union[str, Path, int], 
-                size: Union[int, IconSize] = IconSize.LARGE,
-                icon_index: int = 0) -> ExtractedIcon:
-    """
-    便捷函数：提取图标
-    
-    Args:
-        source: 图标源
-        size: 图标尺寸
-        icon_index: 图标索引
-        
-    Returns:
-        ExtractedIcon: 提取的图标数据
-    """
-    extractor = WindowsIconExtractor()
-    return extractor.extract_icon(source, size, icon_index)
-
-
-def get_file_icon(file_path: Union[str, Path], 
-                 size: Union[int, IconSize] = IconSize.LARGE) -> ExtractedIcon:
-    """
-    便捷函数：获取文件图标
-    
-    Args:
-        file_path: 文件路径
-        size: 图标尺寸
-        
-    Returns:
-        ExtractedIcon: 提取的图标数据
-    """
-    extractor = WindowsIconExtractor()
-    return extractor.extract_file_icon(file_path, size)
-
-
-def get_system_icon(icon_id: int, 
-                   size: Union[int, IconSize] = IconSize.LARGE) -> ExtractedIcon:
-    """
-    便捷函数：获取系统图标
-    
-    Args:
-        icon_id: 系统图标ID
-        size: 图标尺寸
-        
-    Returns:
-        ExtractedIcon: 提取的图标数据
-    """
-    extractor = WindowsIconExtractor()
-    return extractor.extract_system_icon(icon_id, size)
-
-
-def save_icon_to_file(extracted_icon: ExtractedIcon, 
-                     save_path: Union[str, Path], 
-                     format: str = 'PNG') -> bool:
-    """
-    便捷函数：保存图标到文件
-    
-    Args:
-        extracted_icon: 提取的图标数据
-        save_path: 保存路径
-        format: 保存格式
-        
-    Returns:
-        bool: 是否保存成功
-    """
-    extractor = WindowsIconExtractor()
-    return extractor.save_icon(extracted_icon, save_path, format)
-
-
-# ====================== 高级功能 ======================
-
-class AdvancedIconExtractor(WindowsIconExtractor):
-    """高级图标提取器（提供更多功能）"""
-    
-    def extract_all_sizes(self, 
-                         source: Union[str, Path, int],
-                         icon_index: int = 0) -> Dict[int, ExtractedIcon]:
-        """
-        提取所有尺寸的图标
-        
-        Args:
-            source: 图标源
-            icon_index: 图标索引
-            
-        Returns:
-            Dict[int, ExtractedIcon]: 尺寸到图标的映射
-        """
-        sizes = [16, 32, 48, 64, 128, 256]
-        result = {}
-        
-        for size in sizes:
-            icon = self.extract_icon(source, size, icon_index)
-            if icon.success:
-                result[size] = icon
-        
-        return result
-    
-    def extract_icon_family(self, 
-                           file_path: Union[str, Path]) -> Dict[str, List[ExtractedIcon]]:
-        """
-        提取图标族（包含所有尺寸的所有图标）
-        
-        Args:
-            file_path: 文件路径
-            
-        Returns:
-            Dict[str, List[ExtractedIcon]]: 图标索引到尺寸列表的映射
-        """
-        # 首先列出所有图标
-        icons_info = self.list_icons_in_file(file_path)
-        if not icons_info:
-            return {}
-        
-        result = {}
-        sizes = [16, 32, 48, 256]
-        
-        for icon_info in icons_info:
-            icon_index = icon_info.index
-            result[str(icon_index)] = []
-            
-            for size in sizes:
-                icon = self.extract_icon(file_path, size, icon_index)
-                if icon.success:
-                    result[str(icon_index)].append(icon)
-        
-        return result
-    
-    def create_icon_file(self, 
-                        icons: List[ExtractedIcon], 
-                        output_path: Union[str, Path]) -> bool:
-        """
-        创建图标文件（ICO格式）
-        
-        Args:
-            icons: 图标列表（不同尺寸）
-            output_path: 输出路径
-            
-        Returns:
-            bool: 是否创建成功
-        """
-        try:
-            from PIL import Image
-            
-            # 将图标转换为ICO格式
-            icon_images = []
-            for icon in icons:
-                if icon.success and icon.image:
-                    icon_images.append(icon.image)
-            
-            if not icon_images:
-                return False
-            
-            # 保存为ICO文件
-            icon_images[0].save(
-                output_path,
-                format='ICO',
-                append_images=icon_images[1:] if len(icon_images) > 1 else None
-            )
-            return True
-            
-        except Exception as e:
-            warnings.warn(f"创建图标文件失败: {e}")
-            return False

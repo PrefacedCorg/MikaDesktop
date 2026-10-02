@@ -7,3 +7,7 @@ log/
 notify_server/
 dist/
 MikaDesktop.egg-info/
+RinUI/
+acl-report/
+.native-build/
+NotificationBridge.exe

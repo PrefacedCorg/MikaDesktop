@@ -355,9 +355,14 @@ def _on_data_collected(raw):
 
 
 def run(collector=None):
+    """显示进程管理器窗口；首次调用时创建，后续复用已有窗口。返回窗口实例。"""
     global window
-    window = ProcessManagerWindow(collector=collector)
+    if window is None:
+        window = ProcessManagerWindow(collector=collector)
     window.show()
+    window.raise_()
+    window.activateWindow()
+    return window
 
 
 def quit():

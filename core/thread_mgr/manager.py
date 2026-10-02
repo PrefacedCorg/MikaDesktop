@@ -33,6 +33,13 @@ class ThreadInfo:
         self.start_time: Optional[datetime] = None
         self.end_time: Optional[datetime] = None
         self.error: Optional[str] = None
+        #: 该 worker 被启动过几次。QThread 可以重复 start()，而上一轮排队的
+        #: finished 信号可能在下一轮才被投递，用它把过期信号认出来丢掉。
+        self.run_count = 0
+        #: 当前绑定的 finished 回调，重新 run() 时要先断开旧的
+        self.finished_handler = None
+        #: 上一次报错的回调，同理需要在重新 run() 时替换
+        self.error_handler = None
 
 class ThreadManager(QObject):
     """改进的线程管理器"""
@@ -76,15 +83,19 @@ class ThreadManager(QObject):
             )
             
             self.threads[thread_id] = thread_info
-            
-            # 连接线程信号
-            worker.finished.connect(lambda: self._on_thread_finished(thread_id))
+
+            # 注意：这里只连 errorOccurred。finished 的连接放在 run() 里，
+            # 因为 QThread 可以重复 start()，必须按「第几轮」重新绑定，
+            # 否则上一轮排队的 finished 会把新一轮的状态误判成 COMPLETED。
             if hasattr(worker, 'errorOccurred'):
-                worker.errorOccurred.connect(lambda error: self._on_thread_error(thread_id, error))
-            
+                thread_info.error_handler = (
+                    lambda error, tid=thread_id: self._on_thread_error(tid, error)
+                )
+                worker.errorOccurred.connect(thread_info.error_handler)
+
             if start_when_create:
                 self.run(thread_id)
-            
+
             return thread_id
     
     def run(self, thread_id: str) -> bool:
@@ -104,7 +115,22 @@ class ThreadManager(QObject):
                 thread_info.start_time = datetime.now()
                 thread_info.end_time = None
                 thread_info.error = None
-                
+
+                # 按「第几轮」重新绑定 finished：先断开上一轮的回调，再把本轮
+                # 的 run_count 捕获进去。上一轮遗留的、尚未投递的 finished 信号
+                # 会带着旧代数回来，在 _on_thread_finished 里被直接忽略。
+                thread_info.run_count += 1
+                generation = thread_info.run_count
+                previous = thread_info.finished_handler
+                if previous is not None:
+                    try:
+                        thread_info.worker.finished.disconnect(previous)
+                    except (RuntimeError, TypeError):
+                        pass
+                handler = (lambda gen: (lambda: self._on_thread_finished(thread_id, gen)))(generation)
+                thread_info.finished_handler = handler
+                thread_info.worker.finished.connect(handler)
+
                 thread_info.worker.start()
                 self._active_count += 1
                 
@@ -119,33 +145,41 @@ class ThreadManager(QObject):
                 return False
     
     def stop(self, thread_id: str, wait: bool = True, timeout: int = 5000) -> bool:
-        """停止线程"""
+        """停止线程。
+
+        判定以「worker 是否真的在跑」为准，而不只看状态机：状态可能因为上一轮
+        遗留的信号停在 COMPLETED，但线程实际仍在运行，那种情况下也必须能停掉。
+        """
         with self._lock:
             if thread_id not in self.threads:
                 return False
-            
+
             thread_info = self.threads[thread_id]
-            
-            if thread_info.state not in [ThreadState.RUNNING, ThreadState.PAUSED]:
+            was_active = thread_info.state in (ThreadState.RUNNING, ThreadState.PAUSED)
+
+            if not was_active and not thread_info.worker.isRunning():
                 return False
-            
+
             try:
                 old_state = thread_info.state
                 thread_info.state = ThreadState.STOPPING
-                
+
                 thread_info.worker.quit()
-                
+
                 if wait:
                     if not thread_info.worker.wait(timeout):
                         thread_info.worker.terminate()
-                
+                        thread_info.worker.wait(1000)
+
                 thread_info.state = ThreadState.STOPPED
                 thread_info.end_time = datetime.now()
-                self._active_count -= 1
-                
+                # 只有先前被计入活跃数时才减，避免反复 stop 把计数减成负数
+                if was_active:
+                    self._active_count -= 1
+
                 self.thread_state_changed.emit(thread_id, old_state, ThreadState.STOPPED)
                 self.thread_stopped.emit(thread_id, thread_info.name)
-                
+
                 return True
             except Exception as e:
                 thread_info.state = ThreadState.ERROR
@@ -226,10 +260,16 @@ class ThreadManager(QObject):
                 return False
     
     def stop_all(self) -> None:
-        """停止所有线程"""
+        """停止所有线程。
+
+        只要 worker 实际在运行就停，不依赖状态机是否恰好是 RUNNING —— 否则一个
+        状态被误标成 COMPLETED 的线程会在这里被漏掉，退出时留在后台。
+        """
         with self._lock:
-            for thread_id in list(self.threads.keys()):
-                self.stop(thread_id, wait=False)
+            for thread_id, thread_info in list(self.threads.items()):
+                if (thread_info.state in (ThreadState.RUNNING, ThreadState.PAUSED)
+                        or thread_info.worker.isRunning()):
+                    self.stop(thread_id, wait=False)
     
     def get_thread_info(self, thread_id: str) -> Optional[ThreadInfo]:
         """获取线程信息"""
@@ -256,11 +296,18 @@ class ThreadManager(QObject):
         with self._lock:
             return len(self.threads)
     
-    def _on_thread_finished(self, thread_id: str) -> None:
-        """线程完成回调"""
+    def _on_thread_finished(self, thread_id: str, generation: Optional[int] = None) -> None:
+        """线程完成回调。
+
+        ``generation`` 是启动那一轮记录下来的 ``run_count``：QThread 可以重复
+        start()，上一轮排队的 finished 信号可能在下一轮才被投递，届时必须丢弃，
+        否则会把正在运行的新一轮错误地标成 COMPLETED。
+        """
         with self._lock:
             if thread_id in self.threads:
                 thread_info = self.threads[thread_id]
+                if generation is not None and generation != thread_info.run_count:
+                    return
                 old_state = thread_info.state
                 
                 if thread_info.state == ThreadState.RUNNING:
@@ -281,7 +328,9 @@ class ThreadManager(QObject):
                 thread_info.state = ThreadState.ERROR
                 thread_info.error = error
                 thread_info.end_time = datetime.now()
-                self._active_count -= 1
+                # 只有先前确实被计入活跃数时才减，避免计数被减成负数
+                if old_state in (ThreadState.RUNNING, ThreadState.PAUSED):
+                    self._active_count -= 1
                 
                 self.thread_state_changed.emit(thread_id, old_state, ThreadState.ERROR)
                 self.thread_error.emit(thread_id, thread_info.name, error)
