@@ -9,12 +9,14 @@ import subprocess
 
 import win32con
 import win32gui
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QSize, QTimer, QRect, QEvent
+from PySide6.QtCore import (QAbstractAnimation, QEasingCurve, QPropertyAnimation, Qt, QSize, QTimer, QEvent)
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QPen
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QPushButton, QFileDialog, QVBoxLayout, QHBoxLayout,
                                QDialog, QInputDialog)
 from core.custom_ui import IconHoverFilter, ContextPopup, ShutdownDialog
 from core.dock_constants import DockConstants
+from core import dock_extension
+from core.dock_extension import DockExtensionWindow
 from core.dock_tooltip import DockTooltip
 from core.fullscreen_watch import (
     DEFAULT_ENTER_CONFIRM,
@@ -89,6 +91,14 @@ class DockApp(QMainWindow):
         self.xhtelements = []
         self.xht_window = None  # 保存 XHT 窗口引用，防止被 GC 回收
 
+        # dock 右侧的扩展窗口（高度与 dock 相同、宽度 150~600；里面放
+        # 网络/音量/电源与通知中心入口，布局与让位都跟着 dock 走，
+        # 见 core/dock_extension.py 与 core/extension_panel.py）
+        self._extension = None
+        self._extension_panel = None
+        self._status_worker = None
+        self._status_thread_id = None
+
         self.hwnd = None
 
         # 全屏让位状态：True = 有非系统程序正在全屏显示，AppBar 已注销、dock 已隐藏
@@ -102,6 +112,9 @@ class DockApp(QMainWindow):
         self._list_versions: Dict[str, str] = {}
         
         self.init_ui()
+        # 右侧扩展窗口必须在第一次 update_window_position 之前建好，
+        # 这样首次布局就会把它和 dock 一起摆好（见 _init_extension）
+        self._init_extension()
         self.load_settings()
         self.load_pinned_apps()
         self.update_app_buttons()
@@ -123,6 +136,8 @@ class DockApp(QMainWindow):
         self._start_process_monitoring()
         # 全屏程序监听同样登记到 thread_manager，退出时统一收尾
         self._start_fullscreen_watch()
+        # 扩展窗口的状态轮询（网络 / 音量 / 电源）
+        self._start_status_watch()
         # 分辨率/显示器变化后刷新屏幕指标缓存并重新定位
         self._connect_screen_signals()
 
@@ -216,6 +231,13 @@ class DockApp(QMainWindow):
         
         # 添加到布局
         layout.addWidget(button)
+
+        # 新按钮默认是隐藏的，要等 Qt 的 ChildPolished / LayoutRequest 事件处理完才会
+        # 显示；在那之前布局把它当成空项（QWidgetItem::isEmpty()），这一组的最小尺寸
+        # 会被算成 0 —— 紧接着 update_window_position 算出来的目标宽度就是错的（窗口
+        # 缩不回去、多出来的宽度被 app_container 吞掉，那组按钮间距忽大忽小）。
+        # 显式显示，让布局立刻把它算进去；父窗口/父容器本身隐藏时不会有副作用。
+        button.show()
         
         return button
 
@@ -362,6 +384,125 @@ class DockApp(QMainWindow):
         if not self.isVisible():
             sys32.show_window(self.hwnd)
             log.info("dock栏已恢复显示（安全恢复）")
+        # 扩展窗口跟着 dock 一起恢复（让位时是一起藏起来的）
+        self._set_extension_visible(True)
+
+    # ------------------------------------------------------------------ #
+    # 右侧扩展窗口：创建、显隐、宽度（几何布局见 update_window_position）
+    # ------------------------------------------------------------------ #
+    def _init_extension(self):
+        """创建 dock 右侧的扩展窗口，并在里面放上状态面板。
+
+        面板（网络 / 音量 / 电源 / 通知中心）是可选的：构造失败时扩展窗口
+        退化成一块空白卡片，不影响 dock 本体。
+        """
+        try:
+            extension = DockExtensionWindow()
+            # 窗口第一次真正显示时把句柄告诉全屏监听线程：扩展窗口自己也永远
+            # 不该被当成"全屏程序"，否则会触发无意义的让位
+            extension.shown_signal.connect(self._sync_fullscreen_ignored_windows)
+            try:
+                self._build_extension_panel(extension)
+            except Exception as e:
+                log.error(f"创建扩展窗口面板失败（面板区域保持空白）: {e}")
+            self._extension = extension
+            log.info(f"扩展窗口已创建：宽 {extension.extension_width()}，"
+                     f"高 {extension.extension_height()}")
+        except Exception as e:
+            self._extension = None
+            log.error(f"创建扩展窗口失败: {e}")
+
+    def _build_extension_panel(self, extension):
+        """把状态面板放进扩展窗口，并接好宽度联动。"""
+        from core.extension_panel import ExtensionPanel
+        from core.system_status import SystemStatusWorker
+
+        self._status_worker = SystemStatusWorker()
+        self._extension_panel = ExtensionPanel(
+            res_dir=os.path.join(self.script_dir, "res"),
+            status_worker=self._status_worker,
+            log=log,
+        )
+        extension.set_content(self._extension_panel)
+        # 内容宽度变化（例如台式机上不显示电源按钮）→ 重新排布 dock + 扩展窗口
+        extension.width_hint_changed.connect(self.set_extension_width)
+
+    def _start_status_watch(self):
+        """把系统状态轮询线程登记到统一线程管理器并启动（需要 thread_manager 就绪）。"""
+        worker = getattr(self, '_status_worker', None)
+        if worker is None:
+            return
+        try:
+            self._status_thread_id = self.thread_manager.create(
+                name="dock_system_status",
+                start_when_create=True,
+                worker=worker,
+            )
+        except Exception as e:
+            log.warning(f"注册系统状态线程失败，改为直接启动: {e}")
+            try:
+                worker.start()
+            except Exception as exc:
+                log.error(f"启动系统状态线程失败: {exc}")
+
+    def _set_extension_visible(self, visible: bool):
+        """按 dock 的显隐状态显示 / 隐藏扩展窗口（全屏让位时一并让位）。"""
+        extension = getattr(self, '_extension', None)
+        if extension is None:
+            return
+        try:
+            if visible:
+                if not extension.isVisible():
+                    extension.show()
+                # 显示后再按 dock 的真实几何对一次位置/高度：首次显示时 dock 的
+                # 高度会被 Qt 布局撑到最小高度，不能沿用布局前的估算值
+                self._follow_extension()
+            else:
+                extension.hide()
+        except Exception as e:
+            log.error(f"{'显示' if visible else '隐藏'}扩展窗口失败: {e}")
+
+    def _follow_extension(self):
+        """把扩展窗口贴到 dock 实际矩形的右侧（间隙见 EXTENSION_GAP）。
+
+        dock 移动 / 改变大小都会走到这里（``moveEvent`` / ``resizeEvent``），
+        所以扩展窗口的左边界始终 = dock 右边界 + 间隙，绝不与 dock 重叠；
+        顶边和高度也始终等于 dock 的真实值。
+        """
+        extension = getattr(self, '_extension', None)
+        if extension is None:
+            return
+        try:
+            extension.follow_dock(self.geometry())
+        except Exception as e:
+            log.debug(f"跟随 dock 摆放扩展窗口失败: {e}")
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self._follow_extension()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._follow_extension()
+
+    def set_extension_width(self, width):
+        """调整扩展窗口宽度（自动夹到 150~600）并重排 dock + 扩展窗口。
+
+        返回夹取后的宽度；没有扩展窗口时返回 ``None``。给后续往扩展窗口里放
+        内容的代码用，当前启动阶段不用调用（启动宽度就是最小值）。
+        """
+        extension = getattr(self, '_extension', None)
+        if extension is None:
+            return None
+        new_width = extension.set_extension_width(width)
+        self._geom_anim_target = None
+        self.update_window_position()
+        # 改宽度会改变 dock 的目标位置；若几何恰好没变，上面不会触发移动事件，
+        # 这里再对齐一次，保证改完宽度两者仍然是贴着的
+        self._follow_extension()
+        log.info(f"扩展窗口宽度已调整为 {new_width}")
+        return new_width
+
 
     # ------------------------------------------------------------------ #
     # 全屏程序让位：注销 AppBar + 隐藏 dock（判定规则见 core/fullscreen_watch.py）
@@ -426,12 +567,16 @@ class DockApp(QMainWindow):
             log.info("全屏程序监听已停止")
 
     def _sync_fullscreen_ignored_windows(self):
-        """把 dock 自己的窗口句柄告诉监听线程（永远不会被当成全屏程序）。"""
+        """把 dock 与扩展窗口自己的句柄告诉监听线程（永远不会被当成全屏程序）。"""
         worker = getattr(self, '_fs_worker', None)
         if worker is None:
             return
+        hwnds = [self.hwnd] if self.hwnd else []
+        extension_hwnd = getattr(getattr(self, '_extension', None), 'hwnd', None)
+        if extension_hwnd:
+            hwnds.append(extension_hwnd)
         try:
-            worker.set_ignored_hwnds([self.hwnd] if self.hwnd else [])
+            worker.set_ignored_hwnds(hwnds)
         except Exception as e:
             log.debug(f"同步忽略窗口失败: {e}")
 
@@ -479,6 +624,10 @@ class DockApp(QMainWindow):
         except Exception as e:
             log.error(f"隐藏 dock 窗口失败: {e}")
 
+        # 扩展窗口与 dock 是同一个视觉整体，必须一起让位（它没有自己的 AppBar
+        # 保留区，让位后同样不能留在全屏画面上）
+        self._set_extension_visible(False)
+
     def exit_fullscreen_suppression(self):
         """全屏程序已退出：重新注册 AppBar 并显示 dock。"""
         if not getattr(self, '_fs_suppressed', False):
@@ -505,6 +654,9 @@ class DockApp(QMainWindow):
         except Exception as e:
             log.error(f"恢复 dock 显示失败: {e}")
         finally:
+            # 扩展窗口跟着 dock 一起恢复；放在 finally 里，上面任何一步失败也
+            # 不至于"dock 回来了、扩展窗口还藏着"
+            self._set_extension_visible(True)
             self._fs_last_description = ""
 
     def _dock_target_y(self):
@@ -518,8 +670,7 @@ class DockApp(QMainWindow):
         if not work_bottom:
             screen = QApplication.primaryScreen()
             work_bottom = screen.availableGeometry().bottom() if screen is not None else 0
-        window_height = DockConstants.ICON_SIZE + DockConstants.WINDOW_MARGIN * 2
-        return work_bottom - window_height
+        return work_bottom - DockConstants.WINDOW_HEIGHT
 
 
     def handle_app_click(self, app_data):
@@ -729,7 +880,12 @@ class DockApp(QMainWindow):
         self.xht_window.show()
 
     def update_window_position(self):
-        """更新窗口位置 - 根据应用数量自动调整宽度（使用动画平滑过渡）"""
+        """更新窗口位置 - 根据应用数量自动调整宽度（使用动画平滑过渡）
+
+        dock 与右侧扩展窗口在同一个算式里布局：两者作为一个整体居中（几何计算见
+        ``core/dock_extension.layout_rects``，纯函数便于测试）；扩展窗口的高度与
+        位置再由 ``_follow_extension`` 按 dock 的真实矩形贴合。
+        """
         # 使用可用几何（工作区）而不是整个屏幕几何
         available_geometry = QApplication.primaryScreen().availableGeometry()
         
@@ -761,42 +917,68 @@ class DockApp(QMainWindow):
         separator1_width = DockConstants.SEPARATOR_WIDTH if (hasattr(self, 'separator') and self.separator.isVisible()) else 0
         separator2_width = DockConstants.SEPARATOR_WIDTH if (hasattr(self, 'running_separator') and self.running_separator.isVisible()) else 0
         
-        # 计算总宽度
+        # dock 按内容算出的期望宽度（上限在 layout_rects 里连同扩展窗口一起收）
         total_width = base_width + pinned_apps_width + separator1_width + user_apps_width + separator2_width + running_apps_width
-        max_width = int(available_geometry.width() * 0.9)
-        window_width = min(total_width, max_width)
-        
-        window_height = DockConstants.ICON_SIZE + DockConstants.WINDOW_MARGIN*2 # Dock窗口高度
-        
-        # 计算主窗口的起始X坐标，使整个系统（主窗口+拓展窗口）居中
-        # 使用可用几何的宽度进行计算
-        x = available_geometry.x() + (available_geometry.width() - window_width) // 2
-        # 将窗口放置在可用几何的底部
-        # 使用保存的原始工作区底部（AppBar 注册后 available_geometry 会变化）
+        # Qt 布局会强制一个最小尺寸（内容 + 边距 + 间距），比上面按按钮累加的值大；
+        # 目标矩形用真实尺寸，否则窗口显示后又被 Qt 撑宽，整体会偏离中心（扩展窗口
+        # 也会跟着偏）。这一步必须同步激活布局再读，否则刚增删完按钮时读到的还是
+        # 上一次的最小尺寸（见 _refresh_layout_minimum / _relax_minimum_size）。
+        layout_min = self._refresh_layout_minimum()
+        if layout_min is not None and layout_min.isValid():
+            total_width = max(total_width, int(layout_min.width()))
+
+        # 将窗口放置在可用几何的底部：使用保存的原始工作区底部
+        # （AppBar 注册后 available_geometry 会变化）
         work_bottom = getattr(self, '_original_work_area_bottom', 0) or available_geometry.bottom()
-        y = work_bottom - window_height
-        
-        # 确保 x 不为负
-        if x < 0:
-            x = 0
-        
-        # 先设定主窗口目标矩形
-        target_rect = QRect(x, y, window_width, window_height)
-        
+
+        extension = getattr(self, '_extension', None)
+        extension_width = extension.extension_width() if extension is not None else 0
+
+        # 主窗口 + 扩展窗口的目标矩形（一并居中、等高）
+        target_rect, extension_rect = dock_extension.layout_rects(
+            available_geometry, total_width, extension_width,
+            DockConstants.WINDOW_HEIGHT, work_bottom,
+        )
+        # 高度也要对齐 Qt 真正强制的最小高度（布局最小高度是 90，名义常量是 48）。
+        # 否则 current_rect == target_rect 永远不成立，每轮轮询都会重启动画。
+        # 注意只加高矩形、不动 y：AppBar 保留区的上边界始终是
+        # work_bottom - WINDOW_HEIGHT（_dock_target_y 的算式）。
+        if layout_min is not None and layout_min.isValid():
+            target_rect.setHeight(max(target_rect.height(), int(layout_min.height())))
+
         # 如果窗口尚未显示，直接设置几何（避免首次不可见时的动画问题）
         if not self.isVisible():
             self.setGeometry(target_rect)
+            # 扩展窗口按 dock 的**实际**矩形贴合（不是按估算的目标矩形），
+            # 两者之间固定留 EXTENSION_GAP，不会重叠
+            self._follow_extension()
             return
         
         # 如果当前几何与目标相同，不重复动画
         current_rect = self.geometry()
         if current_rect == target_rect:
+            self._follow_extension()
             return
 
-        # 目标矩形没变过就不重启动画：进程轮询每 500ms 会走到这里，反复
-        # stop()/start() 会让窗口一直停在动画中途，看上去就是持续抖动。
-        if getattr(self, '_geom_anim_target', None) == target_rect:
+        animation = self.geometry_anim
+        animating = (isinstance(animation, QPropertyAnimation)
+                     and animation.state() == QAbstractAnimation.Running)
+        target_unchanged = getattr(self, '_geom_anim_target', None) == target_rect
+
+        # 正在往同一个目标做动画：不重启动画。进程轮询每 500ms 会走到这里，
+        # 反复 stop()/start() 会让窗口一直停在动画中途，看上去就是持续抖动。
+        if target_unchanged and animating:
             return
+
+        # 目标没变但已经不在动画中（上一轮动画被 Qt 用旧的最小尺寸夹住、没到位）：
+        # 直接落位一次把它纠回来。否则窗口会一直偏宽，多出来的宽度被
+        # app_container（唯一带 stretch 的项）吞掉，那一组按钮间距就会忽大忽小。
+        if target_unchanged:
+            log.debug(f"几何未到目标（{current_rect} != {target_rect}），直接落位")
+            self.setGeometry(target_rect)
+            self._follow_extension()
+            return
+
         self._geom_anim_target = target_rect
 
         # 复用同一个动画对象，避免每次重建（下同：只在缺失时创建）
@@ -804,6 +986,8 @@ class DockApp(QMainWindow):
             self.geometry_anim = QPropertyAnimation(self, b"geometry", self)
             self.geometry_anim.setDuration(DockConstants.GEOMETRY_ANIM_DURATION)
             self.geometry_anim.setEasingCurve(QEasingCurve.OutCubic)
+            # 动画结束没到位就补一次（Qt 可能用旧的最小尺寸把动画帧夹回去）
+            self.geometry_anim.finished.connect(self._on_geometry_anim_finished)
 
         try:
             self.geometry_anim.stop()
@@ -814,7 +998,62 @@ class DockApp(QMainWindow):
         self.geometry_anim.setEasingCurve(QEasingCurve.OutCubic)
         
         self.geometry_anim.start()
-    
+
+        # 扩展窗口不需要自己的动画：动画期间 dock 每移动/改变一帧都会触发
+        # moveEvent/resizeEvent，_follow_extension() 就贴在它右侧一起滑过去
+        self._follow_extension()
+
+    # ------------------------------------------------------------------ #
+    # 布局最小尺寸：Qt 是异步更新的，这里同步取一次并用它算目标矩形
+    # ------------------------------------------------------------------ #
+    def _refresh_layout_minimum(self):
+        """同步激活布局并返回它当前的最小尺寸（读不到返回 ``None``）。
+
+        按钮增删、分组显隐会把布局标脏，但重算走的是稍后才处理的 LayoutRequest。
+        刚改完内容就调用 ``minimumSizeHint()`` 会拿到**上一次**的最小尺寸，于是目标
+        宽度还是旧值、窗口根本不收缩；等布局真正更新后也没人再重排，窗口就一直偏宽
+        （多出来的宽度被 app_container 吞掉 → 那一组按钮间距忽大忽小）。这里先把
+        布局同步激活，再读到真实值。
+        """
+        try:
+            layout = self.layout()
+            if layout is not None:
+                layout.activate()
+            central = self.centralWidget()
+            if central is not None and central.layout() is not None:
+                central.layout().activate()
+            size = self.minimumSizeHint()
+        except Exception as e:
+            log.debug(f"同步布局最小尺寸失败: {e}")
+            return None
+        self._relax_minimum_size(size)
+        return size
+
+    def _relax_minimum_size(self, layout_min):
+        """布局最小尺寸变小时，同步放低窗口自身的 ``minimumSize``。
+
+        布局把最小尺寸写到窗口上也是异步的：内容变少后窗口的 ``minimumSize`` 还停在
+        旧的大值上，紧接着的 ``setGeometry``/几何动画会被它夹回去（窗口缩不动）。
+        只放低、不抬高 —— 放大方向不需要这个（目标比旧最小尺寸大，本来就不受夹）。
+        """
+        try:
+            if not layout_min.isValid():
+                return
+            if self.minimumWidth() > layout_min.width():
+                self.setMinimumWidth(layout_min.width())
+            if self.minimumHeight() > layout_min.height():
+                self.setMinimumHeight(layout_min.height())
+        except Exception as e:
+            log.debug(f"同步窗口最小尺寸失败: {e}")
+
+    def _on_geometry_anim_finished(self):
+        """几何动画结束：没到目标就补一次落位，并让扩展窗口跟上来。"""
+        target = getattr(self, '_geom_anim_target', None)
+        if target is not None and self.geometry() != target:
+            log.debug(f"几何动画结束未到位 {self.geometry()} -> {target}，直接落位")
+            self.setGeometry(target)
+        self._follow_extension()
+
 
     
     def create_special_button(self, icon_path: str, click_handler, right_click_handler=None) -> QPushButton:
@@ -1341,6 +1580,15 @@ class DockApp(QMainWindow):
                     log.error(f"停止全屏监听线程时出错: {e}")
             self._fs_worker = None
 
+            # 扩展窗口的状态轮询同理（未登记进管理器时是直接启动的，需要显式停）
+            status_worker = getattr(self, '_status_worker', None)
+            if status_worker is not None:
+                try:
+                    status_worker.stop()
+                except Exception as e:
+                    log.error(f"停止系统状态线程时出错: {e}")
+                self._status_worker = None
+
             # 使用统一的线程管理器停止所有后台服务
             if hasattr(self, 'thread_manager') and self.thread_manager:
                 try:
@@ -1372,11 +1620,11 @@ class DockApp(QMainWindow):
         super().showEvent(event)
         if self.hwnd is None:
             self.hwnd = int(self.winId())
-            # dock 自己的窗口永远不该被当成"全屏程序"
+            # dock 自己的窗口永远不该被当成"全屏程序"（扩展窗口同理，见
+            # _sync_fullscreen_ignored_windows）
             self._sync_fullscreen_ignored_windows()
-        else:
-            # 窗口被系统恢复显示时，确保 Topmost 层级正确
-            self._ensure_dock_visible()
+        # 窗口被系统恢复显示时，确保 Topmost 层级正确；扩展窗口一起恢复
+        self._ensure_dock_visible()
 
 
 def main():

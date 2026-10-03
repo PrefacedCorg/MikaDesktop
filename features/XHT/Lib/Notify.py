@@ -47,9 +47,12 @@ GUI 线程。
 * ``N`` = N 秒后收起内容；若还有未读则保留 ``🔔N``，并且如果小黑条是被这条通知
   自动弹出来的，还会自动收回贴边。
 
-未读数清零
+未读与点击
 ----------
-点击 🔔 图标或展开的内容时清零（``mark_read()``）。
+* 点击 **🔔 图标**（badge 模式）：打开**系统通知中心**，然后清零未读 —— 多条通知
+  堆在小黑条里逐条点开容易乱，交给系统通知中心看更清楚。
+* 点击**展开的内容**（expand 模式）：按需把它当作"打开这条通知"发回应用，再清零
+  （``mark_read()``）。
 
 线程模型
 --------
@@ -123,6 +126,21 @@ HERO_MAX_HEIGHT = 90
 
 #: 激活结果在小黑条上停留多久（毫秒）
 FEEDBACK_MS = 3000
+
+
+def _default_open_center() -> bool:
+    """默认的"打开系统通知中心"实现：交给 :mod:`core.system_status`。
+
+    XHT 是本项目里的一个 feature，依赖 shared 的 core 层没问题；拿不到时返回
+    ``False``，只影响"点 🔔 打开通知中心"这一步，不影响其它逻辑。
+    """
+    try:
+        from core.system_status import open_notification_center
+
+        return bool(open_notification_center())
+    except Exception:
+        logger.debug("打开系统通知中心失败（core.system_status 不可用？）")
+        return False
 
 #: 链接 href 前缀：按钮在 :attr:`ToastContent.button_actions` 里的下标
 ACTION_SCHEME = "xht-action:"
@@ -256,7 +274,7 @@ class NotificationBadge(QLabel):
         self._actions = ()
         self.setTextFormat(Qt.TextFormat.PlainText)
         self.setText(format_unread(unread))
-        self.setToolTip("点击标记为已读")
+        self.setToolTip("点击打开通知中心")
         self.setVisible(True)
 
     def show_content(self, content, unread: int = 1, app_name: str = "",
@@ -585,7 +603,7 @@ class NotificationPresenter(QObject):
     activationFinished = Signal(object)
 
     def __init__(self, window, badge: NotificationBadge, config: dict = None, log=None,
-                 thread_manager=None, dispatcher=None, prompt=None):
+                 thread_manager=None, dispatcher=None, prompt=None, open_center=None):
         super().__init__(window)
         self.window = window
         self.badge = badge
@@ -604,9 +622,11 @@ class NotificationPresenter(QObject):
         self._activating = 0
         self._activation_item = None   # 正在激活的那条通知（用来判断期间有没有新通知）
 
-        # 注入点：dispatcher 负责「把动作发回应用」，prompt 负责「收集输入框内容」
+        # 注入点：dispatcher 负责「把动作发回应用」，prompt 负责「收集输入框内容」，
+        # open_center 负责「打开系统通知中心」（点 🔔 时用）
         self.dispatcher = dispatcher or ActionDispatcher()
         self.prompt = prompt
+        self.open_center = open_center or _default_open_center
 
         # 统一线程管理器（可选）。传入时监听线程会注册进去，退出时随
         # ThreadManager.stop_all() 一起收尾，而不是各停各的。
@@ -742,9 +762,26 @@ class NotificationPresenter(QObject):
         self.log.warning("通知监听不可用：%s", message)
 
     def on_clicked(self) -> None:
-        """点击内容本体：按需把它当作「打开这条通知」发回应用，然后清零未读。"""
+        """点击 🔔 图标 / 展开的内容。
+
+        * ``badge`` 模式（点的是 🔔N）：打开**系统通知中心**，然后清零未读 ——
+          多条通知堆在小黑条里逐条点开容易乱，交给系统通知中心看更清楚。
+        * ``expand`` 模式（点的是内容）：按需把它当作「打开这条通知」发回应用，
+          再清零未读。
+        """
+        if self.mode == MODE_BADGE:
+            ok = False
+            try:
+                ok = bool(self.open_center())
+            except Exception as exc:  # noqa: BLE001 - 打不开通知中心也不能影响清零
+                self.log.warning("打开通知中心失败：%s", exc)
+            self.log.info("点击 🔔：%s",
+                          "已打开系统通知中心" if ok else "系统通知中心打开失败")
+            self.mark_read()
+            return
+
         item = self.last_item
-        if self.click_activates and item is not None and self.mode == MODE_EXPAND:
+        if self.click_activates and item is not None:
             self._start_activation(item, action=None, inputs=None, target="body")
         self.mark_read()
 

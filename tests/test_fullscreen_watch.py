@@ -9,6 +9,7 @@
 import os
 import sys
 import time
+import types
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -261,6 +262,10 @@ check("DockApp 提供进入/退出让位方法",
 check("DockApp 提供让位线程的启停方法",
       callable(getattr(dock_module.DockApp, "_start_fullscreen_watch", None))
       and callable(getattr(dock_module.DockApp, "_stop_fullscreen_watch", None)))
+check("DockApp 提供右侧扩展窗口的创建与显隐方法",
+      callable(getattr(dock_module.DockApp, "_init_extension", None))
+      and callable(getattr(dock_module.DockApp, "_set_extension_visible", None))
+      and callable(getattr(dock_module.DockApp, "set_extension_width", None)))
 
 
 class FakeDock:
@@ -275,6 +280,7 @@ class FakeDock:
         self.calls = []
         self.hidden = False
         self.shown = False
+        self.extension_visible = None
 
     # -- 被测方法真正会碰到的宿主能力 --
     def hide_icon_tooltip(self):
@@ -294,9 +300,24 @@ class FakeDock:
     def update_window_position(self):
         self.calls.append("reposition")
 
+    def _set_extension_visible(self, visible):
+        self.extension_visible = visible
+        self.calls.append("extension_show" if visible else "extension_hide")
+
     _dock_target_y = dock_module.DockApp._dock_target_y
     enter_fullscreen_suppression = dock_module.DockApp.enter_fullscreen_suppression
     exit_fullscreen_suppression = dock_module.DockApp.exit_fullscreen_suppression
+    _sync_fullscreen_ignored_windows = dock_module.DockApp._sync_fullscreen_ignored_windows
+
+
+class FakeWorker:
+    """替身：只记录被登记的忽略句柄。"""
+
+    def __init__(self):
+        self.ignored = None
+
+    def set_ignored_hwnds(self, hwnds):
+        self.ignored = list(hwnds)
 
 
 class FakeSys32:
@@ -330,6 +351,8 @@ try:
     check("进入让位会注销 AppBar", fake_sys32.calls[0] == "remove_appbar", fake_sys32.calls)
     check("进入让位会隐藏 dock", fake_dock.hidden is True)
     check("进入让位会收起提示条", "hide_tooltip" in fake_dock.calls, fake_dock.calls)
+    check("进入让位会隐藏右侧扩展窗口", fake_dock.extension_visible is False,
+          fake_dock.calls)
     check("进入让位后状态标记为挂起", fake_dock._fs_suppressed is True)
 
     calls_before = len(fake_sys32.calls)
@@ -343,6 +366,8 @@ try:
     check("重新注册前会刷新屏幕指标", "refresh_metrics" in fake_sys32.calls, fake_sys32.calls)
     check("退出让位会重新显示 dock", fake_dock.shown is True)
     check("退出让位会重排窗口", "reposition" in fake_dock.calls, fake_dock.calls)
+    check("退出让位会恢复右侧扩展窗口", fake_dock.extension_visible is True,
+          fake_dock.calls)
     check("退出让位后挂起标记清除", fake_dock._fs_suppressed is False)
 
     # AppBar 本来就没注册时（例如上一轮已经注销过）不该重复注销
@@ -357,6 +382,25 @@ try:
     check("_dock_target_y 与窗口位置算式一致",
           dock2._dock_target_y() == 864 - (dock_module.DockConstants.ICON_SIZE
                                            + dock_module.DockConstants.WINDOW_MARGIN * 2))
+
+    # 扩展窗口的句柄也要进忽略列表，否则它自己会被判成"全屏程序"触发让位
+    sync_dock = FakeDock(appbar_registered=True)
+    sync_dock.hwnd = 0x111
+    sync_dock._extension = types.SimpleNamespace(hwnd=0x222)
+    sync_dock._fs_worker = FakeWorker()
+    sync_dock._sync_fullscreen_ignored_windows()
+    check("忽略列表包含 dock 与扩展窗口的句柄",
+          sync_dock._fs_worker.ignored == [0x111, 0x222], sync_dock._fs_worker.ignored)
+
+    sync_dock._extension.hwnd = None
+    sync_dock._sync_fullscreen_ignored_windows()
+    check("扩展窗口还没有句柄时只登记 dock",
+          sync_dock._fs_worker.ignored == [0x111], sync_dock._fs_worker.ignored)
+
+    sync_dock._extension = None
+    sync_dock._sync_fullscreen_ignored_windows()
+    check("没有扩展窗口时也不报错",
+          sync_dock._fs_worker.ignored == [0x111], sync_dock._fs_worker.ignored)
 finally:
     dock_module.sys32 = real_sys32
 

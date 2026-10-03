@@ -21,6 +21,14 @@ class DockConstants:
     PROCESS_CHECK_INTERVAL = 500   # 进程检查间隔（毫秒）
     GEOMETRY_ANIM_DURATION = 220   # 窗口宽度变化动画时长（毫秒）
 
+    # dock 与右侧扩展窗口共用的窗口高度（见 core/dock_extension.py）
+    WINDOW_HEIGHT = ICON_SIZE + WINDOW_MARGIN * 2
+
+    # 右侧扩展窗口：宽度范围与启动宽度、以及和 dock 之间的间隙
+    EXTENSION_MIN_WIDTH = 150      # 启动时以这个宽度注册
+    EXTENSION_MAX_WIDTH = 600
+    EXTENSION_GAP = 12             # dock 与扩展窗口之间的间隙（像素），嫌挤/嫌远改这里
+
     # 颜色常量（基于UI配色方案）
     COLOR_BACKGROUND = "#F8F9FA"      # Surface - 卡片、输入框背景
     COLOR_HOVER = "#80E0D7"           # Primary Light - 悬停状态
@@ -97,5 +105,24 @@ class DockConstants:
             font-size: 16px;
             background-color: transparent;
             padding: 0 8px;
+        }}
+    """
+
+    # 扩展窗口里的状态按钮：与 dock 按钮同一套描边。
+    # 状态由图标本身表达（状态图标是 make_app_icon 模板合成的彩色字形），所以没有
+    # "激活态"变体 —— 再叠一层主色描边会和图标颜色语义打架。
+    EXTENSION_BUTTON_STYLE = f"""
+        QPushButton {{
+            border: 2px solid {COLOR_BORDER_INACTIVE};
+            border-radius: {BORDER_RADIUS}px;
+            background-color: {COLOR_BACKGROUND};
+        }}
+        QPushButton:hover {{
+            border: 2px solid {COLOR_BORDER_ACTIVE};
+            background-color: {COLOR_HOVER};
+        }}
+        QPushButton:pressed {{
+            border: 2px solid {COLOR_BORDER_ACTIVE};
+            background-color: {COLOR_BG_ACTIVE};
         }}
     """

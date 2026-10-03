@@ -817,6 +817,33 @@ def test_display():
     check("开启后点击内容会激活应用",
           dispatched == [(None, {}, "body")], dispatched)
 
+    # 点 🔔（badge 模式）→ 打开系统通知中心，不激活应用，之后清零未读。
+    # open_center 是注入点，测试里不碰真实系统。
+    opened = []
+    presenter.open_center = lambda: (opened.append(True), True)[1]
+    presenter.apply_config({"notify_enabled": True, "notify_mode": "badge"}, start=False)
+    dispatched.clear()
+    presenter.on_notification(item)
+    presenter.on_notification(item)
+    check("badge 模式显示 🔔N", presenter.unread == 2 and "🔔" in badge2.text(),
+          badge2.text())
+    check("🔔 的 tooltip 提示会打开通知中心",
+          badge2.toolTip() == "点击打开通知中心", badge2.toolTip())
+    presenter.on_clicked()
+    pump(app, 0.5)
+    check("点击 🔔 打开系统通知中心", opened == [True], opened)
+    check("点击 🔔 不激活应用", dispatched == [], dispatched)
+    check("点击 🔔 后未读清零", presenter.unread == 0, presenter.unread)
+
+    # 展开模式点内容时不应该去开通知中心
+    opened.clear()
+    presenter.apply_config({"notify_enabled": True, "notify_mode": "expand",
+                            "notify_click_activates": False}, start=False)
+    presenter.on_notification(item)
+    presenter.on_clicked()
+    pump(app, 0.5)
+    check("展开模式点内容不打开通知中心", opened == [], opened)
+
     # 静默模式不动外观；未读仍累计
     presenter.apply_config({"notify_enabled": True, "notify_mode": "silent"}, start=False)
     badge2.clear()
